@@ -1,6 +1,6 @@
 # agent-deck.nvim
 
-A Neovim plugin that integrates [agent-deck](https://github.com/nnishant/agent-deck) into Neovide — manage AI coding sessions (Claude, Codex, OpenCode) without leaving your editor.
+A Neovim plugin that integrates [agent-deck](https://github.com/asheshgoplani/agent-deck) into Neovide — manage AI coding sessions (Claude, Codex, OpenCode) without leaving your editor.
 
 ## Features
 
