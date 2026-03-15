@@ -1,0 +1,90 @@
+*agent-deck.txt*  Neovim integration for agent-deck AI session management
+
+==============================================================================
+CONTENTS                                              *agent-deck-contents*
+
+  1. Introduction .......................... |agent-deck-introduction|
+  2. Setup ................................. |agent-deck-setup|
+  3. Commands .............................. |agent-deck-commands|
+  4. Keymaps ............................... |agent-deck-keymaps|
+  5. Statusline ............................ |agent-deck-statusline|
+  6. Logging ............................... |agent-deck-logging|
+
+==============================================================================
+1. INTRODUCTION                                   *agent-deck-introduction*
+
+agent-deck.nvim integrates the agent-deck CLI with Neovide. Sessions for
+Claude, Codex, and OpenCode are opened as native Neovim terminals
+(vim.fn.termopen) so Nerd Font glyphs and colours render correctly.
+
+Terminal buffers are cached with `bufhidden=hide` so processes survive
+window close and can be instantly reattached from the picker.
+
+==============================================================================
+2. SETUP                                               *agent-deck-setup*
+
+>lua
+  require("agent-deck").setup()
+<
+
+Options: none currently. setup() loads the persist map, resolves the initial
+project, starts the polling timer, and registers user commands.
+
+==============================================================================
+3. COMMANDS                                         *agent-deck-commands*
+
+*:AgentDeckInfo*
+  Open a split showing the current project, live Neovide buffers, project
+  sessions, last Dal selection, status totals, persist file path, and the
+  agent-deck binary path.
+
+*:AgentDeckLog*
+  Open the debug log file (~/.local/share/nvim/agent-deck/debug.log) in a
+  bottom split. Press R to reload, q to close.
+
+*:AgentDeckLogClear*
+  Truncate the debug log file.
+
+==============================================================================
+4. KEYMAPS                                           *agent-deck-keymaps*
+
+Recommended keybindings (not set automatically):
+
+  <leader>Dap   Session picker (Snacks.picker with multi-select)
+  <leader>Dal   Reload last picker selection in the same layout
+  <leader>DaX   Close all parallel terminal windows
+  <leader>Dan   Launch a new session (tool → title wizard)
+  <leader>Dag   Set/attach project group
+  <leader>Dar   Restart sessions in external agent-deck daemon
+  <leader>DaR   Kill and respawn Neovide terminal buffers
+  <leader>Dak   Stop all sessions for the current project
+  <leader>DaI   Import untracked sessions into the project
+  <leader>Das   Send visual selection to primary session (visual mode)
+  <leader>DaS   Open compose float for multi-line prompt
+  <leader>Dao   View last session response
+
+==============================================================================
+5. STATUSLINE                                     *agent-deck-statusline*
+
+>lua
+  require("agent-deck.statusline").component
+<
+
+Returns a string like "AD ● 2  ◐ 1" showing running/waiting counts for the
+current project's sessions. Returns "" when no sessions are active.
+
+==============================================================================
+6. LOGGING                                           *agent-deck-logging*
+
+Log file: ~/.local/share/nvim/agent-deck/debug.log
+
+WARN and ERROR level messages also surface via vim.notify. DEBUG messages
+are written to the log file only unless debug mode is enabled:
+
+>lua
+  require("agent-deck.logger").enable_debug()   -- DEBUG → vim.notify too
+  require("agent-deck.logger").disable_debug()
+<
+
+==============================================================================
+vim:tw=78:ft=help:norl:

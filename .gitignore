@@ -1,0 +1,7 @@
+# Vim swap / undo files
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
