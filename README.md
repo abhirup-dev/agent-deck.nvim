@@ -78,6 +78,31 @@ Shows `AD ● 2  ◐ 1` when sessions are active for the current project.
 
 Terminal processes are spawned with `vim.fn.termopen()` and their buffers are kept alive with `bufhidden=hide`. Closing a window does **not** kill the process — reopening the same session from the picker is instant (no re-spawn, conversation context preserved).
 
+### Session identity — CLI / Neovide sync contract
+
+The agent-deck CLI daemon and the Neovim plugin share a single source of truth for every session: the `claude_session_id` stored in agent-deck's database and mirrored on disk as a `.jsonl` conversation file under `~/.claude/projects/`.
+
+**Lifecycle of a new Claude session (`<leader>Dan`):**
+
+1. `agent-deck launch` — agent-deck pre-generates a UUID as `claude_session_id` and immediately starts claude in a tmux pane with `claude --session-id <uuid>`. No `.jsonl` file exists yet.
+2. The nvim plugin detects the missing file (`claude_conv_exists()`) and opens its native terminal with the **same** `claude --session-id <uuid>`.
+3. Once the user sends the first message, claude writes `~/.claude/projects/<path>/<uuid>.jsonl`.
+4. From this point, `claude --resume <uuid>` works from **any** terminal — Neovide, the agent-deck tmux pane, or an external shell.
+
+**Why `--session-id` for new sessions, `--resume` for existing:**
+
+- `--resume <id>` requires the `.jsonl` file to already exist. Using it before the first message fails with _"No conversation found"_.
+- `--session-id <id>` creates the session with a specific UUID if the file is absent, or attaches to it if present. This matches exactly what agent-deck does internally.
+- Plain `claude` (no flag) would create a **new** UUID diverging from agent-deck's record, breaking external resume and the `<leader>Dar` save/restore flow.
+
+**Parallel sessions (`open_split` / `open_float`):**
+
+Sessions opened via the parallel layout are always pre-existing (selected from the picker or restored via `<leader>Dal`). Their `.jsonl` files are guaranteed to exist, so `build_cmd` in `parallel.lua` always uses `--resume`. No file-existence check is needed there.
+
+**`<leader>Dar` (external daemon restart):**
+
+Restarting sessions via agent-deck would reassign each session to the "last conversation in its working directory" — clobbering distinct sessions that share a cwd. `refresh()` in `init.lua` saves each session's `claude_session_id` before restarting and restores it via `session set` afterward, keeping every session pinned to its own conversation.
+
 ### Two refresh types
 
 - `<leader>Dar` — restarts sessions in the **external agent-deck daemon** (`session restart`). Saves and restores each session's `claude_session_id` to prevent two sessions in the same directory from clobbering each other's conversation.

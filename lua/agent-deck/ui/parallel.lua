@@ -69,12 +69,21 @@ end
 
 --- Build the command string used to spawn a terminal for a session.
 ---
+--- parallel.lua only ever opens sessions that were selected from the picker or
+--- loaded from the last-layout persist.  By the time a session reaches this
+--- function it is always an existing, previously-started session: its .jsonl
+--- conversation file exists on disk and agent-deck's claude_session_id is the
+--- real UUID (not the placeholder written at launch-time before claude runs).
+--- Therefore `--resume` is always correct here — there is no need to check for
+--- file existence or fall back to `--session-id` as picker.lua's spawn_terminal
+--- does for brand-new sessions opened immediately after `<leader>Dan`.
+---
 --- Decision tree:
 ---   1. Tool is "claude" AND we have a claude_session_id from session_show
----      → use `claude --resume <id>` to attach to the exact conversation.
----      This is critical when multiple sessions share the same working directory:
----      without --resume, both would resume the "last conversation in dir",
----      clobbering each other's context after a refresh.
+---      → `claude --resume <id>` attaches to the exact conversation.
+---      Critical for multiple sessions sharing the same cwd: without --resume,
+---      both would land on the "last conversation in that directory", clobbering
+---      each other's context on every parallel refresh.
 ---   2. Any other tool, or claude without a known session ID
 ---      → use session.command (e.g. "codex", "opencode") or fall back to tool name.
 local function build_cmd(session)

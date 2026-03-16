@@ -56,33 +56,80 @@ local function time_ago(created_at)
   return string.format("%dh", math.floor(diff / 3600))
 end
 
+--- Return true if a .jsonl conversation file exists for the given claude session ID
+--- under the encoded project path in ~/.claude/projects/.
+---
+--- Background: agent-deck pre-generates a UUID as claude_session_id when a session
+--- is created via `launch`. It immediately starts claude in a tmux pane with:
+---   claude --session-id <pre-generated-uuid>
+--- Claude creates the .jsonl file only once the TUI is fully initialised and the
+--- first turn begins. Until then the file does not exist on disk.
+---
+--- This predicate is the single source of truth for distinguishing a brand-new
+--- session (file absent) from an existing conversation (file present).  The
+--- distinction determines which claude flag to pass — see spawn_terminal below.
+---
+--- Path encoding: claude stores conversations under
+---   ~/.claude/projects/<encoded-path>/<session-id>.jsonl
+--- where <encoded-path> is the absolute project path with every "/" replaced by "-".
+local function claude_conv_exists(path, session_id)
+  if not path or not session_id or session_id == "" then return false end
+  local encoded = path:gsub("/", "-")
+  local fpath   = vim.fn.expand("~/.claude/projects/") .. encoded .. "/" .. session_id .. ".jsonl"
+  return vim.fn.filereadable(fpath) == 1
+end
+
 --- Spawn a new terminal for a session using the enriched session object.
 ---
---- Command selection:
----   claude + claude_session_id → `claude --resume <id>` (attaches exact conversation)
----   other tool or no session ID → session.command or tool name
+--- ── Command selection ──────────────────────────────────────────────────────────
 ---
---- Why --resume is critical for single sessions too:
----   If the user has two sessions in the same directory and opens them one at a
----   time via the picker, without --resume both would resume the "last" conversation
----   in that directory — the second open would steal the first session's context.
+---   Case 1 – claude, conv file EXISTS  → `claude --resume <claude_session_id>`
+---     The conversation is already initialised; resume attaches to the exact
+---     session regardless of which directory other sessions live in.
+---     Critical for multiple sessions sharing the same cwd: without --resume,
+---     both would re-attach to "the last conversation in that directory",
+---     clobbering each other's context.
 ---
---- Snacks.terminal is used when available (gives a styled float/split with title).
---- Falls back to a plain split + termopen() if Snacks is not loaded.
---- Either way the buffer is cached with bufhidden=hide for instant reattach.
+---   Case 2 – claude, conv file MISSING → `claude --session-id <claude_session_id>`
+---     The session was just created by `agent-deck launch`.  agent-deck
+---     pre-generates a UUID and starts claude in a tmux pane with
+---     `claude --session-id <uuid>`.  We use the SAME flag and the SAME UUID so
+---     the nvim terminal and the agent-deck tmux pane share one session identity.
+---     Using `--resume` here would fail with "No conversation found" because the
+---     .jsonl file does not exist yet.  Using plain `claude` (no flag) would
+---     create a NEW session with a DIFFERENT UUID — diverging from agent-deck's
+---     record and breaking `claude --resume` from any external terminal.
+---
+---   Case 3 – non-claude tool, or no session ID
+---     Use session.command (e.g. "codex", "opencode") or fall back to tool name.
+---
+--- ── Snacks vs plain split ──────────────────────────────────────────────────────
+---   Snacks.terminal is preferred (styled float/split with title and border).
+---   Falls back to a bare split + termopen() when Snacks is not loaded.
+---   Either path caches the buffer with bufhidden=hide for instant reattach.
 local function spawn_terminal(session)
   local state = require("agent-deck.state")
   local tool  = session.tool or "claude"
+  local cwd   = session.path or vim.fn.getcwd()
   local cmd
   if tool == "claude" and session.claude_session_id and session.claude_session_id ~= "" then
-    cmd = "claude --resume " .. session.claude_session_id
-    log.info("spawn_terminal: claude --resume " .. session.claude_session_id
-      .. " for session " .. session.id)
+    if claude_conv_exists(cwd, session.claude_session_id) then
+      -- Case 1: conversation file exists → resume the existing session
+      cmd = "claude --resume " .. session.claude_session_id
+      log.info("spawn_terminal: claude --resume " .. session.claude_session_id
+        .. " for session " .. session.id)
+    else
+      -- Case 2: file absent → new session; use --session-id to stay in sync with
+      -- the UUID agent-deck already assigned and started in its tmux pane.
+      cmd = "claude --session-id " .. session.claude_session_id
+      log.info("spawn_terminal: claude --session-id " .. session.claude_session_id
+        .. " (new, no conv file yet) for session " .. session.id)
+    end
   else
+    -- Case 3: non-claude tool or no session ID
     cmd = session.command or tool
     log.info("spawn_terminal: '" .. cmd .. "' for session " .. session.id)
   end
-  local cwd = session.path or vim.fn.getcwd()
 
   -- Helper: mark buf as hidden (survives window close) and register TermClose
   local function cache(buf)
@@ -367,6 +414,13 @@ function M.pick()
 end
 
 --- Launch a new session wizard: tool → title → launch → persist.
+---
+--- After launch the session is immediately visible in the picker (status=waiting).
+--- Opening it via the picker calls open_session_terminal → spawn_terminal, which
+--- detects the missing .jsonl file and uses `claude --session-id <pre-generated-id>`
+--- to match what agent-deck started in its tmux pane.  Once the user sends the
+--- first message, the .jsonl file is written and `claude --resume <id>` works from
+--- any external terminal — keeping nvim and the agent-deck CLI fully in sync.
 function M.new_session()
   local state   = require("agent-deck.state")
   local group   = require("agent-deck.group")
