@@ -57,6 +57,19 @@ local function setup_term_keymaps(buf)
   vim.keymap.set("t", "<C-S-j>", function()
     vim.api.nvim_feedkeys("\x1b[13;2u", "t", true)
   end, vim.tbl_extend("force", opts, { desc = "multi-line edit (newline without submit)" }))
+  -- Cmd-V paste: send clipboard as bracketed paste directly to the terminal job.
+  -- Bypasses Neovim's paste path so flash.nvim / search mode never see the content.
+  local function paste_to_terminal()
+    local job_id = vim.b.terminal_job_id
+    if job_id then
+      vim.fn.chansend(job_id, "\x1b[200~" .. vim.fn.getreg("+") .. "\x1b[201~")
+    end
+  end
+  vim.keymap.set("t", "<D-v>", paste_to_terminal, opts)
+  vim.keymap.set("n", "<D-v>", function()
+    vim.cmd("startinsert")
+    vim.schedule(paste_to_terminal)
+  end, opts)
   -- Close all parallel windows — NORMAL mode only (user presses <C-x> first)
   vim.keymap.set("n", "q", function() M.close_all() end, opts)
 end
