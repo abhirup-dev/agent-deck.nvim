@@ -108,16 +108,24 @@ end
 ---      Critical for multiple sessions sharing the same cwd: without --resume,
 ---      both would land on the "last conversation in that directory", clobbering
 ---      each other's context on every parallel refresh.
----   2. Any other tool, or claude without a known session ID
+---   2. Tool is "codex" AND we have a resolved Codex thread ID
+---      → `codex resume <id>` attaches to the exact Codex conversation.
+---   3. Any other tool, or no known resume identifier
 ---      → use session.command (e.g. "codex", "opencode") or fall back to tool name.
 local function build_cmd(session)
   local tool = session.tool or "claude"
+  local base_cmd = session.command or tool
   if tool == "claude" and session.claude_session_id and session.claude_session_id ~= "" then
     log.debug("build_cmd: using claude --resume " .. session.claude_session_id
       .. " for session " .. session.id)
     return "claude --resume " .. session.claude_session_id
   end
-  local cmd = session.command or tool
+  if tool == "codex" and session.codex_thread_id and session.codex_thread_id ~= "" then
+    log.debug("build_cmd: using codex resume " .. session.codex_thread_id
+      .. " for session " .. session.id)
+    return base_cmd .. " resume " .. session.codex_thread_id
+  end
+  local cmd = base_cmd
   log.debug("build_cmd: using command '" .. cmd .. "' for session " .. session.id)
   return cmd
 end
@@ -139,19 +147,24 @@ local function prefetch_sessions(sessions, callback)
   for i, s in ipairs(sessions) do
     result[i] = s  -- default: use list data as-is if show fails
     cli.session_show(s.id, function(ok, data)
-      done = done + 1
+      local merged = s
       if ok and type(data) == "table" then
         -- Merge show fields (claude_session_id, profile, etc.) onto the session object
-        result[i] = vim.tbl_extend("force", s, data)
+        merged = vim.tbl_extend("force", s, data)
         log.debug("prefetch_sessions: got claude_session_id=" .. (data.claude_session_id or "nil")
           .. " for " .. s.id)
       else
         log.warn("prefetch_sessions: session_show failed for " .. s.id .. " — using list data")
       end
-      if done == count then
-        log.debug("prefetch_sessions: all " .. count .. " show(s) done")
-        vim.schedule(function() callback(result) end)
-      end
+
+      require("agent-deck.codex").enrich_session(merged, function(enriched)
+        done = done + 1
+        result[i] = enriched
+        if done == count then
+          log.debug("prefetch_sessions: all " .. count .. " show(s) done")
+          vim.schedule(function() callback(result) end)
+        end
+      end)
     end)
   end
 end

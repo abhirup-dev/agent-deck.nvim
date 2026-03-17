@@ -100,7 +100,12 @@ end
 ---     create a NEW session with a DIFFERENT UUID — diverging from agent-deck's
 ---     record and breaking `claude --resume` from any external terminal.
 ---
----   Case 3 – non-claude tool, or no session ID
+---   Case 3 – codex with a known Codex thread ID
+---     Resume the exact Codex conversation with `codex resume <thread-id>`.
+---     The thread ID is inferred from Codex's local state DB on first reopen
+---     and then persisted by agent-deck.nvim.
+---
+---   Case 4 – non-claude tool, or no resume identifier
 ---     Use session.command (e.g. "codex", "opencode") or fall back to tool name.
 ---
 --- ── Snacks vs plain split ──────────────────────────────────────────────────────
@@ -112,6 +117,7 @@ local function spawn_terminal(session)
   local tool  = session.tool or "claude"
   local cwd   = session.path or vim.fn.getcwd()
   local cmd
+  local base_cmd = session.command or tool
   if tool == "claude" and session.claude_session_id and session.claude_session_id ~= "" then
     if claude_conv_exists(cwd, session.claude_session_id) then
       -- Case 1: conversation file exists → resume the existing session
@@ -125,9 +131,13 @@ local function spawn_terminal(session)
       log.info("spawn_terminal: claude --session-id " .. session.claude_session_id
         .. " (new, no conv file yet) for session " .. session.id)
     end
+  elseif tool == "codex" and session.codex_thread_id and session.codex_thread_id ~= "" then
+    cmd = base_cmd .. " resume " .. session.codex_thread_id
+    log.info("spawn_terminal: codex resume " .. session.codex_thread_id
+      .. " for session " .. session.id)
   else
-    -- Case 3: non-claude tool or no session ID
-    cmd = session.command or tool
+    -- Case 4: non-claude tool or no known resume identifier
+    cmd = base_cmd
     log.info("spawn_terminal: '" .. cmd .. "' for session " .. session.id)
   end
 
@@ -225,7 +235,9 @@ local function open_session_terminal(session)
     if not ok then
       log.warn("open_session_terminal: session_show failed for " .. session.id .. " — using list data")
     end
-    vim.schedule(function() spawn_terminal(enriched) end)
+    require("agent-deck.codex").enrich_session(enriched, function(final_session)
+      vim.schedule(function() spawn_terminal(final_session) end)
+    end)
   end)
 end
 

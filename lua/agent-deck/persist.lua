@@ -9,6 +9,7 @@
 --       sessions: ["id1", "id2", ...],     -- ALL sessions tracked for this project
 --       loaded:   { layout, session_ids }  -- last Dal selection (subset of sessions)
 --     },
+--     "_codex_threads": { "<agent-deck-session-id>": "<codex-thread-id>" },
 --     "_cwd_projects": { "/abs/path": "project-slug" },
 --     -- ^^ reverse map: cwd → slug so setup() survives DirChanged / Neovide restart
 --   }
@@ -127,6 +128,9 @@ function M.remove_session(project, session_id)
     end
   end
   _map[project].sessions = pruned
+  if _map["_codex_threads"] then
+    _map["_codex_threads"][session_id] = nil
+  end
   M.save()
 end
 
@@ -163,6 +167,22 @@ end
 function M.get_cwd_project(cwd)
   local m = _map["_cwd_projects"]
   return m and cwd and m[cwd] or nil
+end
+
+--- Persist the Codex thread ID associated with an agent-deck session.
+function M.set_codex_thread(session_id, thread_id)
+  if not session_id or not thread_id or thread_id == "" then return end
+  _map["_codex_threads"] = _map["_codex_threads"] or {}
+  if _map["_codex_threads"][session_id] == thread_id then return end
+  _map["_codex_threads"][session_id] = thread_id
+  log.debug("persist.set_codex_thread: " .. session_id .. " -> " .. thread_id)
+  M.save()
+end
+
+--- Return the persisted Codex thread ID for an agent-deck session (or nil).
+function M.get_codex_thread(session_id)
+  local m = _map["_codex_threads"]
+  return m and session_id and m[session_id] or nil
 end
 
 --- Cross-reference this project's sessions with the live state cache.
