@@ -176,6 +176,14 @@ function M.setup(opts)
       do_poll()
     end,
   })
+
+  -- Start the staleness detection timer (2-min periodic CLI-ahead check)
+  require("agent-deck.sync").start_timer()
+
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group    = ag,
+    callback = function() require("agent-deck.sync").stop_timer() end,
+  })
 end
 
 -- ── Public commands ───────────────────────────────────────────────────────────

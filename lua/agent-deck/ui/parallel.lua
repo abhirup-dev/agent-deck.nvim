@@ -39,6 +39,8 @@ local _last_sessions = {}   -- last sessions passed to open_split/open_float/set
 
 local function setup_term_keymaps(buf)
   local opts = { buffer = buf, silent = true }
+  -- Pass Esc through to the process; double-Esc must NOT exit terminal mode
+  vim.keymap.set("t", "<Esc>", "<Esc>",                 opts)
   -- Exit terminal mode (matches claude-code.lua)
   vim.keymap.set("t", "<C-x>", "<C-\\><C-n>",          opts)
   -- Window navigation from terminal mode
@@ -46,6 +48,15 @@ local function setup_term_keymaps(buf)
   vim.keymap.set("t", "<C-j>", "<C-\\><C-n><C-w>j",    opts)
   vim.keymap.set("t", "<C-k>", "<C-\\><C-n><C-w>k",    opts)
   vim.keymap.set("t", "<C-l>", "<C-\\><C-n><C-w>l",    opts)
+  -- Insert a newline without submitting the prompt (multi-line editing).
+  -- Sends the kitty-protocol Shift+Enter escape sequence (\x1b[13;2u) — the
+  -- same sequence claudecode.nvim's <S-CR> binding sends.  Claude CLI treats
+  -- this as "insert newline" rather than "submit".  <C-S-j> is used instead
+  -- of <S-CR> so the binding works even in terminals that don't deliver
+  -- modified Enter keys through the kitty protocol.
+  vim.keymap.set("t", "<C-S-j>", function()
+    vim.api.nvim_feedkeys("\x1b[13;2u", "t", true)
+  end, vim.tbl_extend("force", opts, { desc = "multi-line edit (newline without submit)" }))
   -- Close all parallel windows — NORMAL mode only (user presses <C-x> first)
   vim.keymap.set("n", "q", function() M.close_all() end, opts)
 end
@@ -316,6 +327,12 @@ end
 --- True when at least one parallel window is open.
 function M.is_open()
   return #_par_wins > 0
+end
+
+--- Returns the current list of open parallel window entries {win, buf, session}.
+--- Must be a getter (not a field alias) because close_all() reassigns _par_wins.
+function M.get_open_wins()
+  return _par_wins
 end
 
 --- Record a user-initiated session selection and persist it for Dal.

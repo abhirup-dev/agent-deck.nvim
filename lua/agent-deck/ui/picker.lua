@@ -131,10 +131,16 @@ local function spawn_terminal(session)
     log.info("spawn_terminal: '" .. cmd .. "' for session " .. session.id)
   end
 
-  -- Helper: mark buf as hidden (survives window close) and register TermClose
+  -- Helper: mark buf as hidden (survives window close), set keymaps, register TermClose
   local function cache(buf)
     vim.bo[buf].bufhidden = "hide"
     state.set_buf(session.id, buf)
+    -- Insert newline without submitting — mirrors claudecode.nvim's <S-CR> binding.
+    -- Sends the kitty-protocol Shift+Enter sequence that Claude CLI interprets as
+    -- "insert newline" rather than "submit".
+    vim.keymap.set("t", "<C-S-j>", function()
+      vim.api.nvim_feedkeys("\x1b[13;2u", "t", true)
+    end, { buffer = buf, silent = true, desc = "multi-line edit (newline without submit)" })
     vim.api.nvim_create_autocmd("TermClose", {
       buffer = buf, once = true,
       callback = function()
@@ -153,6 +159,10 @@ local function spawn_terminal(session)
       win = {
         title  = " " .. (session.title or session.id) .. " ",
         border = "rounded",
+        keys   = {
+          term_normal = false,  -- Esc passes through; use <C-x> to exit terminal mode
+          q = { "<cmd>close<cr>", mode = "n" },  -- q closes window in terminal normal mode
+        },
       },
     })
     cache(vim.api.nvim_get_current_buf())
@@ -162,7 +172,10 @@ local function spawn_terminal(session)
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_win_set_buf(0, buf)
     vim.fn.termopen(cmd, { cwd = cwd })
-    cache(vim.api.nvim_get_current_buf())
+    local cur = vim.api.nvim_get_current_buf()
+    -- q closes the window in terminal normal mode (mirrors Snacks path)
+    vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = cur, desc = "close terminal" })
+    cache(cur)
     vim.cmd("startinsert")
   end
 end

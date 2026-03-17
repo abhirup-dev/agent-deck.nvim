@@ -18,7 +18,8 @@ M.sessions        = {}   -- full list from `agent-deck list --json`
 M.status          = {}   -- aggregated counts from `agent-deck status --json`
 M.current_project = nil  -- slug string, e.g. "post-service-group"
 M._picker_open    = false
-M._session_bufs   = {}   -- session_id → bufnr (native terminal buffers, bufhidden=hide)
+M._session_bufs      = {}   -- session_id → bufnr (native terminal buffers, bufhidden=hide)
+M._session_buf_times = {}   -- session_id → os.time() when buffer was spawned
 
 -- ── Buffer liveness check ─────────────────────────────────────────────────────
 
@@ -50,13 +51,15 @@ end
 --- Register a new native terminal buffer for a session.
 --- Called immediately after vim.fn.termopen() so all subsequent opens reuse it.
 function M.set_buf(session_id, buf)
-  M._session_bufs[session_id] = buf
+  M._session_bufs[session_id]      = buf
+  M._session_buf_times[session_id] = os.time()
 end
 
 --- Remove the buffer mapping for a session (called from TermClose autocmd).
 --- Does NOT kill the buffer — TermClose fires after the process already exited.
 function M.clear_buf(session_id)
-  M._session_bufs[session_id] = nil
+  M._session_bufs[session_id]      = nil
+  M._session_buf_times[session_id] = nil
 end
 
 -- ── Session list API ──────────────────────────────────────────────────────────
