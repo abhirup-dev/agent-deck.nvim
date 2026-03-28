@@ -91,43 +91,13 @@ local function register_process_exit(buf, session_id)
   })
 end
 
+local session_cmd = require("agent-deck.session_cmd")
+
 --- Build the command string used to spawn a terminal for a session.
----
---- parallel.lua only ever opens sessions that were selected from the picker or
---- loaded from the last-layout persist.  By the time a session reaches this
---- function it is always an existing, previously-started session: its .jsonl
---- conversation file exists on disk and agent-deck's claude_session_id is the
---- real UUID (not the placeholder written at launch-time before claude runs).
---- Therefore `--resume` is always correct here — there is no need to check for
---- file existence or fall back to `--session-id` as picker.lua's spawn_terminal
---- does for brand-new sessions opened immediately after `<leader>Dan`.
----
---- Decision tree:
----   1. Tool is "claude" AND we have a claude_session_id from session_show
----      → `claude --resume <id>` attaches to the exact conversation.
----      Critical for multiple sessions sharing the same cwd: without --resume,
----      both would land on the "last conversation in that directory", clobbering
----      each other's context on every parallel refresh.
----   2. Tool is "codex" AND we have a resolved Codex thread ID
----      → `codex resume <id>` attaches to the exact Codex conversation.
----   3. Any other tool, or no known resume identifier
----      → use session.command (e.g. "codex", "opencode") or fall back to tool name.
+--- Delegates to the shared session_cmd module (extracted from the duplicate
+--- logic that previously lived here and in picker.lua).
 local function build_cmd(session)
-  local tool = session.tool or "claude"
-  local base_cmd = session.command or tool
-  if tool == "claude" and session.claude_session_id and session.claude_session_id ~= "" then
-    log.debug("build_cmd: using claude --resume " .. session.claude_session_id
-      .. " for session " .. session.id)
-    return "claude --resume " .. session.claude_session_id
-  end
-  if tool == "codex" and session.codex_thread_id and session.codex_thread_id ~= "" then
-    log.debug("build_cmd: using codex resume " .. session.codex_thread_id
-      .. " for session " .. session.id)
-    return base_cmd .. " resume " .. session.codex_thread_id
-  end
-  local cmd = base_cmd
-  log.debug("build_cmd: using command '" .. cmd .. "' for session " .. session.id)
-  return cmd
+  return session_cmd.build_cmd(session)
 end
 
 --- Pre-fetch full session details for all sessions before opening any windows.
@@ -139,14 +109,14 @@ end
 ---   (fast, possibly wrong cmd) while later windows wait. Prefetching ensures
 ---   all windows open with the correct --resume flag simultaneously.
 local function prefetch_sessions(sessions, callback)
-  local cli    = require("agent-deck.cli")
-  local count  = #sessions
-  local done   = 0
-  local result = {}
+  local backend = require("agent-deck.backend")
+  local count   = #sessions
+  local done    = 0
+  local result  = {}
   log.debug("prefetch_sessions: fetching details for " .. count .. " session(s)")
   for i, s in ipairs(sessions) do
     result[i] = s  -- default: use list data as-is if show fails
-    cli.session_show(s.id, function(ok, data)
+    backend.session_show(s.id, function(ok, data)
       local merged = s
       if ok and type(data) == "table" then
         -- Merge show fields (claude_session_id, profile, etc.) onto the session object
@@ -239,6 +209,21 @@ end
 --- accidentally overwrite the user's persisted loaded state.
 function M.open_split(sessions)
   if #sessions == 0 then return end
+
+  -- cmux backend: sessions live in cmux's UI, not Neovim terminals.
+  -- Focus each session in cmux instead of creating Neovim windows.
+  if require("agent-deck.backend").name() == "cmux" then
+    local backend = require("agent-deck.backend")
+    _last_layout   = "split"
+    sessions       = dedup(sessions)
+    _last_sessions = sessions
+    log.info("open_split (cmux): focusing " .. #sessions .. " session(s) in cmux")
+    for _, s in ipairs(sessions) do
+      backend.focus_session(s.id, function() end)
+    end
+    return
+  end
+
   M.close_all()
   _last_layout   = "split"
   sessions       = dedup(sessions)
@@ -282,6 +267,21 @@ end
 --- _last_sessions updated in memory only (see open_split note above).
 function M.open_float(sessions)
   if #sessions == 0 then return end
+
+  -- cmux backend: sessions live in cmux's UI, not Neovim terminals.
+  -- Focus each session in cmux instead of creating Neovim float windows.
+  if require("agent-deck.backend").name() == "cmux" then
+    local backend = require("agent-deck.backend")
+    _last_layout   = "float"
+    sessions       = dedup(sessions)
+    _last_sessions = sessions
+    log.info("open_float (cmux): focusing " .. #sessions .. " session(s) in cmux")
+    for _, s in ipairs(sessions) do
+      backend.focus_session(s.id, function() end)
+    end
+    return
+  end
+
   M.close_all()
   _last_layout   = "float"
   sessions       = dedup(sessions)
@@ -456,8 +456,8 @@ function M.load_last()
     log.debug("load_last: resolving against already-cached " .. #state.sessions .. " sessions")
     resolve_and_open(state.sessions)
   else
-    log.debug("load_last: state empty — fetching fresh session list from CLI")
-    require("agent-deck.cli").list_sessions(function(ok, sessions)
+    log.debug("load_last: state empty — fetching fresh session list from backend")
+    require("agent-deck.backend").list_sessions(function(ok, sessions)
       if not ok or type(sessions) ~= "table" then
         log.error("load_last: list_sessions failed")
         vim.notify("agent-deck: failed to fetch sessions for Dal", vim.log.levels.ERROR)
