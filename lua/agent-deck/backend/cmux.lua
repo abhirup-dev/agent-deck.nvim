@@ -9,6 +9,17 @@
 -- run in cmux's own GPU-accelerated UI (libghostty) rather than in Neovim
 -- terminal buffers.
 --
+-- CLI command mapping (cmux v0.63+):
+--   tree --all --json       → list all surfaces across workspaces
+--   send --surface <id>     → send text to a surface
+--   send-key --surface <id> → send keypress (enter, ctrl+c, etc.)
+--   new-split <dir>         → create split; returns "OK surface:X workspace:Y"
+--   new-workspace --name    → create workspace; returns "OK workspace:X"
+--   close-surface --surface → close a surface
+--   read-screen --surface   → read terminal output
+--   select-workspace        → switch to workspace (for focus)
+--   close-workspace         → close a workspace
+--
 -- Spawn pattern: identical to cli.lua — vim.uv.spawn + stdout pipe +
 -- vim.schedule for Neovim API safety.
 local M = {}
@@ -21,10 +32,18 @@ local cmux_status = require("agent-deck.backend.cmux_status")
 -- ── Binary resolution ─────────────────────────────────────────────────────────
 local _bin = vim.fn.exepath("cmux")
 if _bin == "" then
-  local fallback = "/usr/local/bin/cmux"
-  if vim.fn.executable(fallback) == 1 then
-    _bin = fallback
-  else
+  -- cmux ships its CLI inside the app bundle; check common locations
+  local fallbacks = {
+    "/Applications/cmux.app/Contents/Resources/bin/cmux",
+    "/usr/local/bin/cmux",
+  }
+  for _, fb in ipairs(fallbacks) do
+    if vim.fn.executable(fb) == 1 then
+      _bin = fb
+      break
+    end
+  end
+  if _bin == "" then
     _bin = "cmux"  -- last resort; will surface spawn-failed error
   end
 end
@@ -89,6 +108,84 @@ local function run_json(args, callback)
   end)
 end
 
+-- ── Helpers ───────────────────────────────────────────────────────────────────
+
+--- Parse cmux "OK <ref> [<ref>...]" response lines.
+--- Returns a table of ref strings, e.g. {"surface:3", "workspace:2"}.
+local function parse_ok_refs(raw)
+  local refs = {}
+  if not raw or not raw:match("^OK") then return refs end
+  for ref in raw:gmatch("([%w]+:[%w%-]+)") do
+    table.insert(refs, ref)
+  end
+  return refs
+end
+
+--- Extract a specific ref type from parsed refs.
+--- E.g. extract_ref(refs, "surface") → "surface:3"
+local function extract_ref(refs, prefix)
+  for _, r in ipairs(refs) do
+    if r:match("^" .. prefix .. ":") then return r end
+  end
+  return nil
+end
+
+--- Fetch all live surfaces via `tree --all --json`.
+--- Callback receives (success, {surface_ref = {workspace_ref=..., pane_ref=..., title=...}}).
+local function get_live_surfaces(callback)
+  run_json({ "tree", "--all", "--json" }, function(ok, data)
+    if not ok then
+      callback(false, data)
+      return
+    end
+    local surfaces = {}
+    local windows = (type(data) == "table" and data.windows) or {}
+    for _, win in ipairs(windows) do
+      for _, ws in ipairs(win.workspaces or {}) do
+        local ws_ref = ws.ref or ""
+        local ws_title = ws.title or ""
+        for _, pane in ipairs(ws.panes or {}) do
+          for _, surf in ipairs(pane.surfaces or {}) do
+            local sref = surf.ref or ""
+            if sref ~= "" then
+              surfaces[sref] = {
+                workspace_ref = ws_ref,
+                workspace_title = ws_title,
+                pane_ref = pane.ref or "",
+                title = surf.title or "",
+                type = surf.type or "terminal",
+              }
+            end
+          end
+        end
+      end
+    end
+    callback(true, surfaces)
+  end)
+end
+
+--- Extract workspaces from tree JSON data.
+--- Returns list of {ref, title, description, surface_count}.
+local function extract_workspaces(tree_data)
+  local result = {}
+  local windows = (type(tree_data) == "table" and tree_data.windows) or {}
+  for _, win in ipairs(windows) do
+    for _, ws in ipairs(win.workspaces or {}) do
+      local surf_count = 0
+      for _, pane in ipairs(ws.panes or {}) do
+        surf_count = surf_count + #(pane.surfaces or {})
+      end
+      table.insert(result, {
+        ref         = ws.ref or "",
+        title       = ws.title or "",
+        description = ws.description,
+        surface_count = surf_count,
+      })
+    end
+  end
+  return result
+end
+
 -- ── Interface methods ─────────────────────────────────────────────────────────
 
 --- Derive aggregate status counts from the session list.
@@ -115,49 +212,32 @@ function M.status(cb)
 end
 
 --- List all tracked cmux sessions.
---- Cross-references persist metadata with live cmux surfaces.
+--- Cross-references persist metadata with live cmux surfaces via `tree --all --json`.
 function M.list_sessions(cb)
-  run_json({ "list-surfaces", "--json" }, function(ok, surfaces_data)
+  get_live_surfaces(function(ok, live_surfaces)
     if not ok then
-      log.error("cmux list_sessions: list-surfaces failed — " .. tostring(surfaces_data))
-      cb(false, surfaces_data)
+      log.error("cmux list_sessions: tree failed — " .. tostring(live_surfaces))
+      cb(false, live_surfaces)
       return
     end
 
-    -- Build a set of live surface IDs for O(1) lookup
-    local live_surfaces = {}
-    local surfaces_list = surfaces_data
-    if type(surfaces_data) == "table" and surfaces_data.surfaces then
-      surfaces_list = surfaces_data.surfaces
-    end
-    local live_count = 0
-    if type(surfaces_list) == "table" then
-      for _, surf in ipairs(surfaces_list) do
-        local sid = surf.surface_id or surf.id
-        if sid then
-          live_surfaces[sid] = true
-          live_count = live_count + 1
-        end
-      end
-    end
-
-    -- Cross-reference with persisted metadata
     local all_cmux = persist.all_cmux_sessions()
     local result = {}
+    local live_count = 0
     local tracked_count = 0
+
+    for ref, _ in pairs(live_surfaces) do live_count = live_count + 1 end
 
     for surface_id, meta in pairs(all_cmux) do
       tracked_count = tracked_count + 1
-      local alive = live_surfaces[surface_id]
+      local alive = live_surfaces[surface_id] ~= nil
       local status
 
       if not alive then
         status = "stopped"
       elseif meta.tool == "claude" and meta.claude_session_id and meta.claude_session_id ~= "" then
-        -- Use .jsonl-based status detection for Claude sessions
         status = cmux_status.detect(meta.path, meta.claude_session_id)
       else
-        -- Non-Claude tools: surface exists = running
         status = "running"
       end
 
@@ -192,26 +272,14 @@ function M.session_show(id, cb)
     return
   end
 
-  -- Verify surface is still alive
-  run_json({ "list-surfaces", "--json" }, function(ok, data)
+  get_live_surfaces(function(ok, live_surfaces)
     if not ok then
-      log.warn("cmux session_show: list-surfaces failed for " .. id)
-      cb(false, data)
+      log.warn("cmux session_show: tree failed for " .. id)
+      cb(false, live_surfaces)
       return
     end
 
-    local alive = false
-    local surfaces_list = data
-    if type(data) == "table" and data.surfaces then
-      surfaces_list = data.surfaces
-    end
-    if type(surfaces_list) == "table" then
-      for _, surf in ipairs(surfaces_list) do
-        local sid = surf.surface_id or surf.id
-        if sid == id then alive = true; break end
-      end
-    end
-
+    local alive = live_surfaces[id] ~= nil
     local status
     if not alive then
       status = "stopped"
@@ -227,18 +295,18 @@ function M.session_show(id, cb)
 end
 
 --- Send text to a cmux surface.
---- cmux send-surface --surface <id> "<text>" + cmux send-key-surface --surface <id> enter
+--- Uses `cmux send --surface <id> -- <text>` + `cmux send-key --surface <id> enter`.
 function M.session_send(id, text, opts, cb)
   log.info("cmux session_send: sending " .. #text .. " chars to surface " .. id)
-  run_raw({ "send-surface", "--surface", id, text }, function(ok, raw)
+  run_raw({ "send", "--surface", id, "--", text }, function(ok, raw)
     if not ok then
-      log.error("cmux session_send: send-surface failed for " .. id .. " — " .. tostring(raw))
+      log.error("cmux session_send: send failed for " .. id .. " — " .. tostring(raw))
       vim.notify("agent-deck [cmux]: failed to send to " .. id, vim.log.levels.ERROR)
       if cb then cb(false, raw) end
       return
     end
     -- Send enter key to submit
-    run_raw({ "send-key-surface", "--surface", id, "enter" }, function(ok2, raw2)
+    run_raw({ "send-key", "--surface", id, "enter" }, function(ok2, raw2)
       if not ok2 then
         log.warn("cmux session_send: send-key enter failed for " .. id)
       else
@@ -250,12 +318,11 @@ function M.session_send(id, text, opts, cb)
 end
 
 --- Read screen output from a cmux surface.
---- Uses cmux read-screen with ANSI stripping.
+--- Uses `cmux read-screen --surface <id> --scrollback --lines 200` with ANSI stripping.
 function M.session_output(id, cb)
   log.debug("cmux session_output: reading screen for " .. id)
   run_raw({ "read-screen", "--surface", id, "--scrollback", "--lines", "200" }, function(ok, raw)
     if not ok then
-      -- Fallback: read-screen may be experimental
       log.warn("cmux session_output: read-screen failed for " .. id .. " — returning empty")
       vim.notify("agent-deck [cmux]: read-screen failed for " .. id, vim.log.levels.WARN)
       cb(true, { output = "" })
@@ -267,26 +334,50 @@ function M.session_output(id, cb)
   end)
 end
 
---- Start a session by re-sending the stored command to the surface.
+--- Start a session by rebuilding and sending the tool command.
+--- Unlike the initial launch (which uses --session-id for new sessions),
+--- restart always uses --resume since the conversation already exists.
 function M.session_start(id, cb)
   local meta = persist.get_cmux_session(id)
-  if not meta or not meta.command then
-    log.error("cmux session_start: no stored command for session " .. tostring(id))
-    vim.notify("agent-deck [cmux]: no command stored for " .. tostring(id), vim.log.levels.ERROR)
+  if not meta then
+    log.error("cmux session_start: session not found in persist — " .. tostring(id))
+    vim.notify("agent-deck [cmux]: session not found — " .. tostring(id), vim.log.levels.ERROR)
     vim.schedule(function()
-      cb(false, "cmux: no stored command for session " .. tostring(id))
+      cb(false, "cmux: session not found — " .. tostring(id))
     end)
     return
   end
-  log.info("cmux session_start: re-sending command '" .. meta.command .. "' to " .. id)
-  run_raw({ "send-surface", "--surface", id, meta.command }, function(ok, raw)
+
+  -- Rebuild command for current state using session_cmd (picks --resume
+  -- for existing conversations, handles claude wrapper + env)
+  local cmd
+  local tool = meta.tool or "claude"
+  if tool == "claude" and meta.claude_session_id and meta.claude_session_id ~= "" then
+    local scmd = require("agent-deck.session_cmd")
+    cmd = scmd.build_cmd(meta)  -- always --resume for existing sessions
+  else
+    cmd = meta.command or tool
+  end
+
+  if not cmd then
+    log.error("cmux session_start: could not build command for " .. id)
+    vim.schedule(function() cb(false, "cmux: no command for " .. id) end)
+    return
+  end
+
+  local full_cmd = "cd " .. vim.fn.shellescape(meta.path or vim.fn.getcwd()) .. " && " .. cmd
+  log.info("cmux session_start: sending '" .. full_cmd .. "' to " .. id)
+
+  -- Send command to the surface shell (assumes tool has been stopped and
+  -- the surface is at a shell prompt — use session_stop first if needed)
+  run_raw({ "send", "--surface", id, "--", full_cmd }, function(ok, raw)
     if not ok then
-      log.error("cmux session_start: send-surface failed for " .. id)
+      log.error("cmux session_start: send failed for " .. id)
       vim.notify("agent-deck [cmux]: failed to start " .. (meta.title or id), vim.log.levels.ERROR)
       cb(false, raw)
       return
     end
-    run_raw({ "send-key-surface", "--surface", id, "enter" }, function(ok2, raw2)
+    run_raw({ "send-key", "--surface", id, "enter" }, function(ok2, raw2)
       if ok2 then
         log.info("cmux session_start: started " .. (meta.title or id))
         vim.notify("agent-deck [cmux]: started " .. (meta.title or id))
@@ -296,40 +387,150 @@ function M.session_start(id, cb)
   end)
 end
 
---- Stop a session by sending Ctrl-C to the surface.
+--- Stop a session by creating a new empty surface then closing the old one.
+--- cmux has no process-kill API; close-surface is the only way to terminate
+--- the running tool. New surface is created FIRST to avoid "cannot close
+--- last surface" error.
 function M.session_stop(id, cb)
-  log.info("cmux session_stop: sending ctrl-c to " .. id)
-  run_raw({ "send-key-surface", "--surface", id, "ctrl-c" }, function(ok, raw)
-    if ok then
-      log.debug("cmux session_stop: ctrl-c sent to " .. id)
-      vim.notify("agent-deck [cmux]: stopped " .. id)
-    else
-      log.warn("cmux session_stop: failed to send ctrl-c to " .. id)
-      vim.notify("agent-deck [cmux]: failed to stop " .. id, vim.log.levels.WARN)
+  local meta = persist.get_cmux_session(id)
+  local wref = meta and meta.workspace_id
+  log.info("cmux session_stop: create+close " .. id .. " in " .. (wref or "?"))
+
+  if not wref then
+    log.warn("cmux session_stop: no workspace for " .. id)
+    cb(false, "cmux: no workspace for " .. id)
+    return
+  end
+
+  -- Step 1: create new surface FIRST (so old one is never the last)
+  run_raw({ "new-split", "right", "--workspace", wref }, function(ok, raw)
+    if not ok then
+      log.warn("cmux session_stop: new-split failed — " .. tostring(raw))
+      cb(false, raw)
+      return
     end
-    cb(ok, raw)
+
+    local refs = parse_ok_refs(raw)
+    local new_ref = extract_ref(refs, "surface")
+
+    -- Step 2: close the old surface (safe now)
+    run_raw({ "close-surface", "--surface", id }, function(ok2, _)
+      if not ok2 then
+        log.warn("cmux session_stop: close-surface failed for " .. id .. " (continuing)")
+      end
+
+      -- Update persist to point to the new surface
+      if new_ref and meta then
+        persist.remove_cmux_session(id)
+        meta.surface_id = new_ref
+        meta.id = new_ref
+        persist.set_cmux_session(new_ref, meta)
+        if meta.group then
+          persist.remove_session(meta.group, id)
+          persist.add_session(meta.group, new_ref)
+        end
+        log.info("cmux session_stop: replaced " .. id .. " → " .. new_ref)
+      end
+
+      vim.notify("agent-deck [cmux]: stopped " .. (meta and meta.title or id))
+      cb(true, raw)
+    end)
   end)
 end
 
---- Restart a session: stop (ctrl-c) then start (resend command) after a delay.
+--- Restart a session: create new surface first, close old one, run the tool command.
+--- Order matters: new-split BEFORE close-surface, because cmux refuses to close
+--- the last surface in a workspace.
 function M.session_restart(id, cb)
-  log.info("cmux session_restart: restarting " .. id)
-  M.session_stop(id, function(ok, _)
+  local meta = persist.get_cmux_session(id)
+  if not meta then
+    log.error("cmux session_restart: session not found — " .. tostring(id))
+    cb(false, "cmux: session not found — " .. tostring(id))
+    return
+  end
+
+  -- Rebuild command for current state.
+  -- Always use the bare tool name as base — never meta.command, which may
+  -- contain a resume command from a previous restart and would double up.
+  local cmd
+  local tool = meta.tool or "claude"
+  if tool == "claude" and meta.claude_session_id and meta.claude_session_id ~= "" then
+    local scmd = require("agent-deck.session_cmd")
+    meta.id = meta.id or meta.surface_id or id  -- ensure id for build_cmd logging
+    cmd = scmd.build_cmd(vim.tbl_extend("force", meta, { command = nil }))
+  elseif tool == "codex" and meta.codex_thread_id and meta.codex_thread_id ~= "" then
+    cmd = "codex resume " .. meta.codex_thread_id
+  else
+    cmd = tool
+  end
+
+  if not cmd then
+    log.error("cmux session_restart: could not build command for " .. id)
+    cb(false, "cmux: no command for " .. id)
+    return
+  end
+
+  local wref = meta.workspace_id
+  local path = meta.path or vim.fn.getcwd()
+  local full_cmd = "cd " .. vim.fn.shellescape(path) .. " && " .. cmd
+  log.info("cmux session_restart: " .. id .. " → " .. full_cmd)
+
+  -- Step 1: create a new surface FIRST (so the old one is never the last)
+  run_raw({ "new-split", "right", "--workspace", wref }, function(ok, raw)
     if not ok then
-      log.error("cmux session_restart: stop failed for " .. id)
-      cb(false, "cmux: failed to stop session " .. tostring(id))
+      log.error("cmux session_restart: new-split failed in " .. (wref or "?"))
+      cb(false, "cmux: failed to create new surface")
       return
     end
-    -- 500ms delay to let ctrl-c take effect before resending command
-    vim.defer_fn(function()
-      M.session_start(id, cb)
-    end, 500)
+
+    local refs = parse_ok_refs(raw)
+    local new_ref = extract_ref(refs, "surface")
+    if not new_ref then
+      log.error("cmux session_restart: could not extract surface ref")
+      cb(false, "cmux: could not determine new surface ref")
+      return
+    end
+
+    -- Step 2: close the OLD surface (safe now — new one exists)
+    run_raw({ "close-surface", "--surface", id }, function(ok2, _)
+      if not ok2 then
+        log.warn("cmux session_restart: close-surface failed for " .. id .. " (continuing)")
+      end
+
+      -- Step 3: update persist with new surface ref.
+      -- Keep command as bare tool name (not the resume variant) so future
+      -- restarts don't double up resume arguments.
+      persist.remove_cmux_session(id)
+      meta.surface_id = new_ref
+      meta.id = new_ref
+      meta.command = tool  -- bare tool name, not the resume command
+      persist.set_cmux_session(new_ref, meta)
+      if meta.group then
+        persist.remove_session(meta.group, id)
+        persist.add_session(meta.group, new_ref)
+      end
+
+      -- Step 4: send the tool command to the new surface
+      run_raw({ "send", "--surface", new_ref, "--", full_cmd }, function(ok3, _)
+        if not ok3 then
+          log.error("cmux session_restart: send failed for " .. new_ref)
+          cb(false, "cmux: failed to send command")
+          return
+        end
+        run_raw({ "send-key", "--surface", new_ref, "enter" }, function(ok4, raw4)
+          if ok4 then
+            log.info("cmux session_restart: restarted " .. (meta.title or id) .. " as " .. new_ref)
+            vim.notify("agent-deck [cmux]: restarted " .. (meta.title or id))
+          end
+          cb(ok4, raw4)
+        end)
+      end)
+    end)
   end)
 end
 
 --- Delete a session by closing the cmux surface and removing persist metadata.
 function M.session_delete(id, cb)
-  -- Fetch metadata BEFORE removing so we can clean up project session list
   local meta = persist.get_cmux_session(id)
   log.info("cmux session_delete: closing surface " .. id
     .. " (title=" .. (meta and meta.title or "?") .. ")")
@@ -366,55 +567,44 @@ function M.launch(path, opts, cb)
   log.info("cmux launch: tool=" .. tool .. " title='" .. title
     .. "' group=" .. group .. " path=" .. path)
 
-  -- Step 1: list existing workspaces to find one for this group
-  run_json({ "list-workspaces", "--json" }, function(ok, ws_data)
+  -- Step 1: list existing workspaces via tree to find one for this group
+  run_json({ "tree", "--all", "--json" }, function(ok, tree_data)
     if not ok then
-      log.error("cmux launch: list-workspaces failed")
+      log.error("cmux launch: tree failed")
       vim.notify("agent-deck [cmux]: failed to list workspaces", vim.log.levels.ERROR)
-      cb(false, ws_data)
+      cb(false, tree_data)
       return
     end
 
-    local workspaces = ws_data
-    if type(ws_data) == "table" and ws_data.workspaces then
-      workspaces = ws_data.workspaces
-    end
-
-    -- Look for an existing workspace matching the group name
-    local workspace_id = nil
-    if type(workspaces) == "table" then
-      for _, ws in ipairs(workspaces) do
-        local ws_name = ws.name or ws.title or ""
-        local ws_id   = ws.workspace_id or ws.id
-        if ws_name == group and ws_id then
-          workspace_id = ws_id
-          log.debug("cmux launch: found existing workspace " .. ws_id .. " for group " .. group)
-          break
-        end
+    local workspaces = extract_workspaces(tree_data)
+    local workspace_ref = nil
+    for _, ws in ipairs(workspaces) do
+      if ws.title == group and ws.ref ~= "" then
+        workspace_ref = ws.ref
+        log.debug("cmux launch: found existing workspace " .. ws.ref .. " for group " .. group)
+        break
       end
     end
 
-    local function create_surface(wid)
+    local function create_surface(wref)
       -- Step 2: create a new split surface in the workspace
-      log.debug("cmux launch: creating split in workspace " .. wid)
-      run_json({ "new-split", "--workspace", wid, "right", "--json" }, function(ok2, split_data)
+      log.debug("cmux launch: creating split in workspace " .. wref)
+      run_raw({ "new-split", "right", "--workspace", wref }, function(ok2, raw)
         if not ok2 then
-          log.error("cmux launch: new-split failed in workspace " .. wid)
+          log.error("cmux launch: new-split failed in workspace " .. wref .. " — " .. tostring(raw))
           vim.notify("agent-deck [cmux]: failed to create surface", vim.log.levels.ERROR)
-          cb(false, split_data)
+          cb(false, raw)
           return
         end
 
-        local surface_id = nil
-        if type(split_data) == "table" then
-          surface_id = split_data.surface_id or split_data.id
-        end
-        if not surface_id then
-          log.error("cmux launch: could not extract surface_id from new-split response")
-          cb(false, "cmux: could not determine surface_id from new-split response")
+        local refs = parse_ok_refs(raw)
+        local surface_ref = extract_ref(refs, "surface")
+        if not surface_ref then
+          log.error("cmux launch: could not extract surface ref from new-split response: " .. raw)
+          cb(false, "cmux: could not determine surface ref from new-split response")
           return
         end
-        log.info("cmux launch: created surface " .. surface_id .. " in workspace " .. wid)
+        log.info("cmux launch: created " .. surface_ref .. " in " .. wref)
 
         -- Step 3: generate UUID for claude_session_id
         local uuid = vim.fn.system("uuidgen"):gsub("%s+", "")
@@ -435,28 +625,35 @@ function M.launch(path, opts, cb)
         else
           cmd = tool
         end
-        log.info("cmux launch: sending command '" .. cmd .. "' to surface " .. surface_id)
+        log.info("cmux launch: sending command '" .. cmd .. "' to " .. surface_ref)
 
-        -- Send command to surface
-        run_raw({ "send-surface", "--surface", surface_id, cmd }, function(ok3, _)
+        -- cd to project path first, then send the tool command
+        -- cmux surfaces default to ~ ; we need the correct cwd for
+        -- Claude's .jsonl path encoding and project context.
+        local full_cmd = "cd " .. vim.fn.shellescape(path) .. " && " .. cmd
+        log.debug("cmux launch: full command: " .. full_cmd)
+        run_raw({ "send", "--surface", surface_ref, "--", full_cmd }, function(ok3, _)
           if not ok3 then
-            log.error("cmux launch: send-surface failed for " .. surface_id)
+            log.error("cmux launch: send failed for " .. surface_ref)
             vim.notify("agent-deck [cmux]: failed to send command", vim.log.levels.ERROR)
-            cb(false, "cmux: failed to send command to surface " .. surface_id)
+            cb(false, "cmux: failed to send command to " .. surface_ref)
             return
           end
-          run_raw({ "send-key-surface", "--surface", surface_id, "enter" }, function(ok4, _)
+          run_raw({ "send-key", "--surface", surface_ref, "enter" }, function(ok4, _)
             if not ok4 then
-              log.error("cmux launch: send-key enter failed for " .. surface_id)
-              cb(false, "cmux: failed to send enter to surface " .. surface_id)
+              log.error("cmux launch: send-key enter failed for " .. surface_ref)
+              cb(false, "cmux: failed to send enter to " .. surface_ref)
               return
             end
 
             -- Step 5: store metadata in persist
-            local now = os.time()
-            persist.set_cmux_session(surface_id, {
-              surface_id        = surface_id,
-              workspace_id      = wid,
+            -- Use UTC date string (not unix int) so codex.infer_thread_id's
+            -- SQLite strftime('%s', created_at) converts correctly to epoch.
+            -- Local time would cause a timezone offset mismatch.
+            local now = os.date("!%Y-%m-%d %H:%M:%S")
+            persist.set_cmux_session(surface_ref, {
+              surface_id        = surface_ref,
+              workspace_id      = wref,
               tool              = tool,
               title             = title,
               path              = path,
@@ -465,14 +662,14 @@ function M.launch(path, opts, cb)
               claude_session_id = (tool == "claude") and uuid or nil,
               created_at        = now,
             })
-            persist.add_session(group, surface_id)
+            persist.add_session(group, surface_ref)
 
             log.info("cmux launch: session '" .. title .. "' launched successfully"
-              .. " (surface=" .. surface_id .. ", workspace=" .. wid .. ")")
+              .. " (surface=" .. surface_ref .. ", workspace=" .. wref .. ")")
             vim.notify("agent-deck [cmux]: launched '" .. title .. "'")
 
             cb(true, {
-              id                = surface_id,
+              id                = surface_ref,
               title             = title,
               path              = path,
               group             = group,
@@ -486,30 +683,27 @@ function M.launch(path, opts, cb)
       end)
     end
 
-    if workspace_id then
-      -- Workspace exists — create surface in it
-      create_surface(workspace_id)
+    if workspace_ref then
+      create_surface(workspace_ref)
     else
       -- Step 1b: create a new named workspace for this group
       log.info("cmux launch: creating new workspace for group " .. group)
-      run_json({ "new-workspace", "--name", group, "--json" }, function(ok2, new_ws)
+      run_raw({ "new-workspace", "--name", group, "--cwd", path }, function(ok2, raw)
         if not ok2 then
-          log.error("cmux launch: new-workspace failed for group " .. group)
+          log.error("cmux launch: new-workspace failed for group " .. group .. " — " .. tostring(raw))
           vim.notify("agent-deck [cmux]: failed to create workspace", vim.log.levels.ERROR)
-          cb(false, new_ws)
+          cb(false, raw)
           return
         end
-        local wid = nil
-        if type(new_ws) == "table" then
-          wid = new_ws.workspace_id or new_ws.id
-        end
-        if not wid then
-          log.error("cmux launch: could not extract workspace_id from new-workspace response")
-          cb(false, "cmux: could not determine workspace_id from new-workspace response")
+        local refs = parse_ok_refs(raw)
+        local wref = extract_ref(refs, "workspace")
+        if not wref then
+          log.error("cmux launch: could not extract workspace ref from response: " .. raw)
+          cb(false, "cmux: could not determine workspace ref from new-workspace response")
           return
         end
-        log.info("cmux launch: created workspace " .. wid .. " for group " .. group)
-        create_surface(wid)
+        log.info("cmux launch: created " .. wref .. " for group " .. group)
+        create_surface(wref)
       end)
     end
   end)
@@ -518,18 +712,15 @@ end
 --- List cmux workspaces as groups.
 --- Returns { groups: [{name, session_count, ...}] } matching agent-deck format.
 function M.group_list(cb)
-  log.debug("cmux group_list: fetching workspaces")
-  run_json({ "list-workspaces", "--json" }, function(ok, data)
+  log.debug("cmux group_list: fetching workspaces via tree")
+  run_json({ "tree", "--all", "--json" }, function(ok, tree_data)
     if not ok then
-      log.error("cmux group_list: list-workspaces failed")
-      cb(false, data)
+      log.error("cmux group_list: tree failed")
+      cb(false, tree_data)
       return
     end
 
-    local workspaces = data
-    if type(data) == "table" and data.workspaces then
-      workspaces = data.workspaces
-    end
+    local workspaces = extract_workspaces(tree_data)
 
     -- Count tracked surfaces per workspace
     local all_cmux = persist.all_cmux_sessions()
@@ -542,15 +733,12 @@ function M.group_list(cb)
     end
 
     local groups = {}
-    if type(workspaces) == "table" then
-      for _, ws in ipairs(workspaces) do
-        local wid = ws.workspace_id or ws.id or ""
-        table.insert(groups, {
-          name          = ws.name or ws.title or wid,
-          workspace_id  = wid,
-          session_count = ws_counts[wid] or 0,
-        })
-      end
+    for _, ws in ipairs(workspaces) do
+      table.insert(groups, {
+        name          = ws.title,
+        workspace_id  = ws.ref,
+        session_count = ws_counts[ws.ref] or 0,
+      })
     end
 
     log.debug("cmux group_list: " .. #groups .. " workspace(s)")
@@ -561,20 +749,19 @@ end
 --- Create a new cmux workspace.
 function M.group_create(name, cb)
   log.info("cmux group_create: creating workspace '" .. name .. "'")
-  run_json({ "new-workspace", "--name", name, "--json" }, function(ok, data)
+  run_raw({ "new-workspace", "--name", name }, function(ok, raw)
     if ok then
-      log.info("cmux group_create: workspace '" .. name .. "' created")
+      log.info("cmux group_create: workspace '" .. name .. "' created — " .. raw:gsub("%s+$", ""))
     else
       log.error("cmux group_create: failed to create workspace '" .. name .. "'")
       vim.notify("agent-deck [cmux]: failed to create workspace '" .. name .. "'", vim.log.levels.ERROR)
     end
-    cb(ok, data)
+    cb(ok, raw)
   end)
 end
 
 --- Move a session to a different group (persist-only for cmux).
---- cmux does not support cross-workspace surface moves, so we just update
---- the persisted metadata.
+--- cmux does not support cross-workspace surface moves natively.
 function M.group_move(id, group, cb)
   local meta = persist.get_cmux_session(id)
   if meta then
@@ -593,7 +780,6 @@ end
 function M.session_set(id, field, value, cb)
   local meta = persist.get_cmux_session(id)
   if meta then
-    -- Map CLI-style field names to Lua keys
     local key = field:gsub("-", "_")
     meta[key] = value
     persist.set_cmux_session(id, meta)
@@ -606,32 +792,30 @@ function M.session_set(id, field, value, cb)
   end)
 end
 
---- Focus a cmux surface: bring it to the front in cmux's UI.
---- cmux focus-surface --surface <id> + cmux select-workspace --workspace <wid>
+--- Focus a cmux surface: bring its workspace to the front.
+--- Uses `cmux select-workspace --workspace <wref>` since cmux has no
+--- direct focus-surface command.
 function M.focus_session(id, cb)
   local meta = persist.get_cmux_session(id)
-  log.info("cmux focus_session: focusing surface " .. id
-    .. " (workspace=" .. (meta and meta.workspace_id or "?") .. ")")
+  local wref = meta and meta.workspace_id
+  log.info("cmux focus_session: focusing " .. id
+    .. " (workspace=" .. (wref or "?") .. ")")
 
-  run_raw({ "focus-surface", "--surface", id }, function(ok, raw)
-    if not ok then
-      log.error("cmux focus_session: focus-surface failed for " .. id .. " — " .. tostring(raw))
-      vim.notify("agent-deck [cmux]: failed to focus " .. id, vim.log.levels.ERROR)
-      if cb then cb(false, raw) end
-      return
-    end
-    -- Also select the workspace if we know it
-    if meta and meta.workspace_id then
-      run_raw({ "select-workspace", "--workspace", meta.workspace_id }, function(ok2, raw2)
-        if not ok2 then
-          log.warn("cmux focus_session: select-workspace failed for " .. meta.workspace_id)
-        end
-        if cb then cb(ok2, raw2) end
-      end)
-    else
-      if cb then cb(true, raw) end
-    end
-  end)
+  if wref then
+    run_raw({ "select-workspace", "--workspace", wref }, function(ok, raw)
+      if not ok then
+        log.warn("cmux focus_session: select-workspace failed for " .. wref)
+        vim.notify("agent-deck [cmux]: failed to focus " .. id, vim.log.levels.WARN)
+      else
+        log.debug("cmux focus_session: selected workspace " .. wref)
+      end
+      if cb then cb(ok, raw) end
+    end)
+  else
+    log.warn("cmux focus_session: no workspace_id for " .. id)
+    vim.notify("agent-deck [cmux]: no workspace info for " .. id, vim.log.levels.WARN)
+    if cb then vim.schedule(function() cb(false, "no workspace_id") end) end
+  end
 end
 
 --- Health check: verify cmux is reachable via `cmux ping`.
@@ -642,7 +826,7 @@ function M.health_check()
       vim.notify("agent-deck [cmux]: connected to cmux")
     else
       log.error("cmux health_check: ping failed — " .. (raw or "unknown error")
-        .. ". Is cmux running? Ensure CMUX_SOCKET_MODE=allowAll if Neovide runs outside cmux.")
+        .. ". Is cmux running? Ensure socket access is enabled in cmux Settings.")
       vim.notify("agent-deck [cmux]: cannot reach cmux! Is it running?", vim.log.levels.ERROR)
     end
   end)

@@ -95,7 +95,10 @@ local session_cmd  = require("agent-deck.session_cmd")
 local function spawn_terminal(session)
   local state = require("agent-deck.state")
   local cwd   = session.path or vim.fn.getcwd()
-  local cmd   = session_cmd.build_cmd_new(session, claude_paths.conv_exists)
+  -- cmux-enriched sessions have _cmd_ready=true — command already built by
+  -- enrich_cmux_sessions. Agent-deck sessions go through build_cmd_new.
+  local cmd   = session._cmd_ready and session.command
+    or session_cmd.build_cmd_new(session, claude_paths.conv_exists)
   if not cmd then
     vim.notify("agent-deck: session is running in agent-deck but has no conversation yet.\n"
       .. "Send a first message in the agent-deck terminal, then retry.", vim.log.levels.WARN)
@@ -187,21 +190,32 @@ local function open_session_terminal(session)
     return
   end
 
-  -- cmux backend: sessions live in cmux's UI, not Neovim terminals.
-  -- Focus the surface in cmux instead of spawning a terminal buffer.
+  -- cmux backend: build command from persist metadata directly.
+  -- Uses session_cmd.build_cmd (shared util, always --resume for existing
+  -- sessions). Does NOT use the agent-deck path (session_show callback,
+  -- codex.enrich_session, build_cmd_new decision tree).
   if require("agent-deck.backend").name() == "cmux" then
-    log.info("open_session_terminal: cmux backend — focusing surface " .. session.id)
-    require("agent-deck.backend").focus_session(session.id, function(ok, _)
-      if not ok then
-        vim.schedule(function()
-          vim.notify("agent-deck: failed to focus cmux surface " .. session.id, vim.log.levels.ERROR)
-        end)
-      end
-    end)
+    local persist = require("agent-deck.persist")
+    local scmd    = require("agent-deck.session_cmd")
+    local meta    = persist.get_cmux_session(session.id)
+    if not meta then
+      log.warn("open_session_terminal (cmux): no persist data for " .. session.id)
+      vim.notify("agent-deck: session metadata not found for " .. session.id, vim.log.levels.WARN)
+      return
+    end
+    -- Ensure id is set (persist stores surface_id, not id)
+    meta.id = meta.id or meta.surface_id or session.id
+    -- build_cmd uses --resume for claude sessions with claude_session_id,
+    -- bare command for other tools
+    local cmd = scmd.build_cmd(meta)
+    local cwd = meta.path or vim.fn.getcwd()
+    log.info("open_session_terminal (cmux): spawning terminal for " .. session.id
+      .. " cmd=" .. cmd .. " cwd=" .. cwd)
+    spawn_terminal(vim.tbl_extend("force", session, meta, { command = cmd, path = cwd, _cmd_ready = true }))
     return
   end
 
-  -- Slow path: fetch full details to get claude_session_id, then spawn
+  -- Slow path (agent-deck backend): fetch full details to get claude_session_id, then spawn
   log.debug("open_session_terminal: no live buf for " .. session.id .. " — fetching session_show")
   require("agent-deck.backend").session_show(session.id, function(ok, data)
     local enriched = (ok and type(data) == "table")
@@ -479,6 +493,45 @@ function M.new_session()
           vim.notify("agent-deck: launch failed", vim.log.levels.ERROR)
         end
       end)
+    end)
+  end)
+end
+
+--- Focus a session in cmux's UI (cmux backend only).
+--- Opens a single-select picker; on confirm, calls backend.focus_session
+--- to bring the cmux surface/workspace to the front.
+function M.focus_pick()
+  local backend = require("agent-deck.backend")
+  if backend.name() ~= "cmux" then
+    vim.notify("agent-deck: focus_pick is only available with the cmux backend", vim.log.levels.WARN)
+    return
+  end
+
+  local state = require("agent-deck.state")
+  local sessions = state.get_sessions()
+  if not sessions or #sessions == 0 then
+    vim.notify("agent-deck: no sessions to focus", vim.log.levels.INFO)
+    return
+  end
+
+  -- Build picker items
+  local items = {}
+  for _, s in ipairs(sessions) do
+    local icon = ICONS[s.status] or "?"
+    local label = icon .. "  " .. (s.title or s.id) .. "  [" .. (s.group or "") .. "]"
+    table.insert(items, { text = label, session = s })
+  end
+
+  vim.ui.select(items, {
+    prompt = "Focus session in cmux:",
+    format_item = function(item) return item.text end,
+  }, function(choice)
+    if not choice then return end
+    log.info("focus_pick: focusing " .. choice.session.id .. " in cmux")
+    backend.focus_session(choice.session.id, function(ok, _)
+      if not ok then
+        vim.notify("agent-deck: failed to focus " .. choice.session.id, vim.log.levels.ERROR)
+      end
     end)
   end)
 end

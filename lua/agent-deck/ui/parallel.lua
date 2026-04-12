@@ -97,8 +97,36 @@ local claude_paths = require("agent-deck.claude_paths")
 --- Build the command string used to spawn a terminal for a session.
 --- Uses build_cmd_new to handle new sessions (no .jsonl yet) correctly
 --- by falling back to --session-id instead of --resume.
+--- Agent-deck backend only.
 local function build_cmd(session)
   return session_cmd.build_cmd_new(session, claude_paths.conv_exists)
+end
+
+-- ── cmux-specific helpers ─────────────────────────────────────────────────────
+-- These are separate from the agent-deck flow (prefetch_sessions + build_cmd_new)
+-- because cmux sessions have different metadata sources (persist, not CLI) and
+-- always use --resume (sessions already exist in cmux surfaces).
+
+--- Enrich sessions from cmux persist metadata synchronously.
+--- Returns a list of sessions with command and path filled in via
+--- session_cmd.build_cmd (always --resume for existing sessions).
+local function enrich_cmux_sessions(sessions)
+  local persist = require("agent-deck.persist")
+  local result = {}
+  for _, s in ipairs(sessions) do
+    local meta = persist.get_cmux_session(s.id)
+    if meta then
+      -- Ensure id is always set (persist stores surface_id, not id)
+      meta.id = meta.id or meta.surface_id or s.id
+      local cmd = session_cmd.build_cmd(meta)
+      result[#result + 1] = vim.tbl_extend("force", s, meta, { command = cmd, _cmd_ready = true })
+      log.debug("enrich_cmux_sessions: " .. s.id .. " cmd=" .. (cmd or "nil"))
+    else
+      result[#result + 1] = s
+      log.warn("enrich_cmux_sessions: no persist data for " .. s.id)
+    end
+  end
+  return result
 end
 
 --- Pre-fetch full session details for all sessions before opening any windows.
@@ -167,8 +195,12 @@ local function start_terminal(win, session)
     log.debug("start_terminal: reusing buf " .. existing .. " for session " .. session.id)
     vim.api.nvim_win_set_buf(win, existing)
   else
-    -- Slow path: spawn a new native terminal process
-    local cmd = build_cmd(session)
+    -- Slow path: spawn a new native terminal process.
+    -- cmux-enriched sessions have _cmd_ready=true — command is already the
+    -- final terminal command (built by enrich_cmux_sessions via build_cmd).
+    -- Agent-deck sessions go through build_cmd_new which handles --session-id
+    -- vs --resume based on .jsonl existence.
+    local cmd = session._cmd_ready and session.command or build_cmd(session)
     if not cmd then
       vim.notify("agent-deck: '" .. (session.title or session.id)
         .. "' is waiting in agent-deck (needs permission or first message). "
@@ -192,6 +224,77 @@ local function start_terminal(win, session)
   setup_term_keymaps(cur_buf)
   table.insert(_par_wins, { win = win, buf = cur_buf, session = session })
   return cur_buf
+end
+
+-- ── Shared window creation ────────────────────────────────────────────────────
+-- Extracted so both the agent-deck path (async prefetch) and cmux path
+-- (sync persist enrichment) can share the same layout logic.
+
+--- Create horizontal split windows for enriched sessions.
+local function do_open_split(enriched)
+  vim.cmd("stopinsert")
+
+  local height = math.floor(vim.o.lines * 0.35)
+  vim.cmd("botright " .. height .. "split")
+  start_terminal(vim.api.nvim_get_current_win(), enriched[1])
+
+  for i = 2, #enriched do
+    vim.api.nvim_set_current_win(_par_wins[1].win)
+    vim.cmd("vsplit")
+    start_terminal(vim.api.nvim_get_current_win(), enriched[i])
+  end
+
+  vim.cmd("wincmd =")
+
+  for _, entry in ipairs(_par_wins) do
+    vim.api.nvim_set_current_win(entry.win)
+    vim.cmd("startinsert")
+  end
+end
+
+--- Create floating tile windows for enriched sessions.
+local function do_open_float(enriched)
+  vim.cmd("stopinsert")
+
+  local n = #enriched
+  local usable_h = vim.o.lines
+    - vim.o.cmdheight
+    - (vim.o.laststatus > 0 and 1 or 0)
+    - (vim.o.showtabline > 0 and 1 or 0)
+
+  local total_w = math.floor(vim.o.columns * 0.90)
+  local height  = math.floor(usable_h       * 0.60)
+  local gap     = 1
+  local win_w   = math.floor((total_w - (n - 1) * gap) / n)
+  local start_c = math.floor((vim.o.columns - total_w) / 2)
+  local row     = math.floor((usable_h - height) / 2)
+
+  for i, session in ipairs(enriched) do
+    local col = start_c + (i - 1) * (win_w + gap)
+    log.debug("do_open_float: window " .. i .. " at col=" .. col .. " w=" .. win_w)
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    local win = vim.api.nvim_open_win(buf, true, {
+      relative  = "editor",
+      row       = row,
+      col       = col,
+      width     = win_w,
+      height    = height,
+      border    = "rounded",
+      title     = " " .. (session.title or session.id) .. " ",
+      title_pos = "center",
+      style     = "minimal",
+    })
+
+    start_terminal(win, session)
+  end
+
+  for _, entry in ipairs(_par_wins) do
+    if vim.api.nvim_win_is_valid(entry.win) then
+      vim.api.nvim_set_current_win(entry.win)
+      vim.cmd("startinsert")
+    end
+  end
 end
 
 -- ── Public API ────────────────────────────────────────────────────────────────
@@ -218,17 +321,16 @@ end
 function M.open_split(sessions)
   if #sessions == 0 then return end
 
-  -- cmux backend: sessions live in cmux's UI, not Neovim terminals.
-  -- Focus each session in cmux instead of creating Neovim windows.
+  -- cmux backend: enrich sessions from persist (not session_show + codex.enrich).
+  -- Uses session_cmd.build_cmd (always --resume) instead of build_cmd_new.
   if require("agent-deck.backend").name() == "cmux" then
-    local backend = require("agent-deck.backend")
+    M.close_all()
     _last_layout   = "split"
     sessions       = dedup(sessions)
     _last_sessions = sessions
-    log.info("open_split (cmux): focusing " .. #sessions .. " session(s) in cmux")
-    for _, s in ipairs(sessions) do
-      backend.focus_session(s.id, function() end)
-    end
+    log.info("open_split (cmux): opening " .. #sessions .. " session(s) in splits")
+    local enriched = enrich_cmux_sessions(sessions)
+    do_open_split(enriched)
     return
   end
 
@@ -241,28 +343,7 @@ function M.open_split(sessions)
   -- Prefetch claude_session_id for all sessions before creating any windows.
   -- This ensures every termopen() call uses --resume <correct_id>.
   prefetch_sessions(sessions, function(enriched)
-    vim.cmd("stopinsert")
-
-    local height = math.floor(vim.o.lines * 0.35)
-    vim.cmd("botright " .. height .. "split")
-    start_terminal(vim.api.nvim_get_current_win(), enriched[1])
-
-    -- Additional sessions: vsplit within the first row so they tile horizontally
-    for i = 2, #enriched do
-      vim.api.nvim_set_current_win(_par_wins[1].win)
-      vim.cmd("vsplit")
-      start_terminal(vim.api.nvim_get_current_win(), enriched[i])
-    end
-
-    vim.cmd("wincmd =")  -- equalize widths so all terminals share space evenly
-
-    -- Enter insert mode in each terminal after ALL windows exist.
-    -- Doing this inside start_terminal would focus each window as it's created,
-    -- causing flickering and leaving focus on the wrong (last) window.
-    for _, entry in ipairs(_par_wins) do
-      vim.api.nvim_set_current_win(entry.win)
-      vim.cmd("startinsert")
-    end
+    do_open_split(enriched)
   end)
 end
 
@@ -276,17 +357,15 @@ end
 function M.open_float(sessions)
   if #sessions == 0 then return end
 
-  -- cmux backend: sessions live in cmux's UI, not Neovim terminals.
-  -- Focus each session in cmux instead of creating Neovim float windows.
+  -- cmux backend: enrich sessions from persist (not session_show + codex.enrich).
   if require("agent-deck.backend").name() == "cmux" then
-    local backend = require("agent-deck.backend")
+    M.close_all()
     _last_layout   = "float"
     sessions       = dedup(sessions)
     _last_sessions = sessions
-    log.info("open_float (cmux): focusing " .. #sessions .. " session(s) in cmux")
-    for _, s in ipairs(sessions) do
-      backend.focus_session(s.id, function() end)
-    end
+    log.info("open_float (cmux): opening " .. #sessions .. " session(s) as floats")
+    local enriched = enrich_cmux_sessions(sessions)
+    do_open_float(enriched)
     return
   end
 
@@ -297,48 +376,7 @@ function M.open_float(sessions)
   log.info("open_float: opening " .. #sessions .. " session(s) as floating tiles")
 
   prefetch_sessions(sessions, function(enriched)
-    vim.cmd("stopinsert")
-
-    local n = #enriched
-    -- Subtract UI chrome (cmdline, statusline, tabline) from usable height
-    local usable_h = vim.o.lines
-      - vim.o.cmdheight
-      - (vim.o.laststatus > 0 and 1 or 0)
-      - (vim.o.showtabline > 0 and 1 or 0)
-
-    local total_w = math.floor(vim.o.columns * 0.90)
-    local height  = math.floor(usable_h       * 0.60)
-    local gap     = 1
-    local win_w   = math.floor((total_w - (n - 1) * gap) / n)
-    local start_c = math.floor((vim.o.columns - total_w) / 2)
-    local row     = math.floor((usable_h - height) / 2)
-
-    for i, session in ipairs(enriched) do
-      local col = start_c + (i - 1) * (win_w + gap)
-      log.debug("open_float: window " .. i .. " at col=" .. col .. " w=" .. win_w)
-
-      local buf = vim.api.nvim_create_buf(false, true)
-      local win = vim.api.nvim_open_win(buf, true, {
-        relative  = "editor",
-        row       = row,
-        col       = col,
-        width     = win_w,
-        height    = height,
-        border    = "rounded",
-        title     = " " .. (session.title or session.id) .. " ",
-        title_pos = "center",
-        style     = "minimal",
-      })
-
-      start_terminal(win, session)
-    end
-
-    for _, entry in ipairs(_par_wins) do
-      if vim.api.nvim_win_is_valid(entry.win) then
-        vim.api.nvim_set_current_win(entry.win)
-        vim.cmd("startinsert")
-      end
-    end
+    do_open_float(enriched)
   end)
 end
 
@@ -522,7 +560,43 @@ function M.refresh()
   state._session_bufs = {}
   log.debug("refresh: killed " .. killed .. " job(s); buf cache cleared")
 
-  -- Respawn in the same layout so the user lands in the same view
+  -- cmux backend: always fetch fresh sessions and respawn.
+  -- Surface refs change after Dar (close+recreate), so _par_wins is stale.
+  -- Fetch live session list from backend to get current refs.
+  if require("agent-deck.backend").name() == "cmux" then
+    local backend = require("agent-deck.backend")
+    local grp     = require("agent-deck.group")
+    local project = state.current_project
+    log.info("refresh (DaR/cmux): fetching fresh sessions from backend")
+    backend.list_sessions(function(ok, sessions)
+      if not ok or type(sessions) ~= "table" then
+        log.error("refresh (DaR/cmux): list_sessions failed")
+        return
+      end
+      state.set_sessions(sessions)
+      local fresh = {}
+      for _, s in ipairs(sessions) do
+        if project and grp.slugify(s.group or "") == project then
+          table.insert(fresh, s)
+        end
+      end
+      if #fresh == 0 then
+        log.warn("refresh (DaR/cmux): no project sessions found")
+        return
+      end
+      log.info("refresh (DaR/cmux): respawning " .. #fresh .. " session(s)")
+      vim.schedule(function()
+        if layout == "float" then
+          M.open_float(fresh)
+        else
+          M.open_split(fresh)
+        end
+      end)
+    end)
+    return
+  end
+
+  -- agent-deck backend: respawn with current sessions if windows were open
   if was_open and #current_sessions > 0 then
     if layout == "float" then
       M.open_float(current_sessions)

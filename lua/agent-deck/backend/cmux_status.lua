@@ -55,37 +55,41 @@ function M.detect(path, session_id)
     return "idle"
   end
 
-  -- Find the last non-empty line (JSON entry)
-  local last_line = nil
+  -- Collect all non-empty lines from the tail, then walk backwards
+  -- to find the last meaningful entry (assistant/human/user).
+  -- The .jsonl contains system, attachment, and other entries that
+  -- should be skipped for status detection.
+  local lines = {}
   for line in tail:gmatch("[^\n]+") do
     if line:match("%S") then
-      last_line = line
+      lines[#lines + 1] = line
     end
   end
 
-  if not last_line then
-    return "idle"
-  end
-
-  local ok, entry = pcall(vim.json.decode, last_line)
-  if not ok or type(entry) ~= "table" then
-    log.debug("cmux_status.detect: failed to parse last JSON line in " .. fpath)
-    return "idle"
-  end
-
-  -- Decision tree based on entry type and stop_reason
-  local entry_type = entry.type
-  if entry_type == "assistant" then
-    if entry.stop_reason == "end_turn" then
-      return "waiting"
+  -- Walk backwards to find the last assistant/human/user entry
+  for i = #lines, 1, -1 do
+    local ok, entry = pcall(vim.json.decode, lines[i])
+    if ok and type(entry) == "table" then
+      local entry_type = entry.type
+      if entry_type == "assistant" then
+        -- stop_reason may be at entry.stop_reason or entry.message.stop_reason
+        local sr = entry.stop_reason
+        if not sr and type(entry.message) == "table" then
+          sr = entry.message.stop_reason
+        end
+        if sr == "end_turn" then
+          return "waiting"
+        end
+        -- Assistant message without end_turn — still generating
+        return "running"
+      elseif entry_type == "human" or entry_type == "user" then
+        return "running"
+      end
+      -- Skip system, attachment, and other non-message entries
     end
-    -- Assistant message without end_turn — still generating
-    return "running"
-  elseif entry_type == "human" or entry_type == "user" then
-    return "running"
   end
 
-  -- Unknown entry type — default to idle
+  -- No assistant/human entry found — idle
   return "idle"
 end
 

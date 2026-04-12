@@ -76,34 +76,64 @@ local function do_poll()
             -- Prune any errored sessions from the persist map
             persist.load_project(project)
 
-            -- Codex thread sync: unlike Claude (whose session UUID is tracked
-            -- natively by agent-deck via `session show --json → claude_session_id`),
-            -- Codex thread IDs live only in Codex's own SQLite DB. agent-deck
-            -- has no codex_thread_id field, so the plugin must resolve and
-            -- persist the mapping itself. For sessions with a live Neovim buffer
-            -- but no persisted thread, enrich from SQLite on each poll.
-            -- This catches threads created after Dan launch (codex creates
-            -- the thread only after the user sends the first message).
+            -- ── Codex thread sync ──────────────────────────────────────────────
+            -- Codex thread IDs live only in Codex's own SQLite DB. The plugin
+            -- resolves them via codex.enrich_session (shared util) and persists
+            -- the mapping. Threads appear only after the user sends the first
+            -- message, so poll-based sync catches them after launch.
+            --
+            -- agent-deck and cmux backends use separate persist stores:
+            --   agent-deck: persist._codex_threads[agent-deck-session-id]
+            --   cmux:       persist._cmux_sessions[surface-ref].codex_thread_id
             local codex = require("agent-deck.codex")
-            for _, s in ipairs(sessions) do
-              if (s.tool or "") == "codex"
-                and s.status ~= "error" and s.status ~= "stopped"
-                and grp.slugify(s.group or "") == project then
-                local saved = persist.get_codex_thread(s.id)
-                if not saved or saved == "" then
-                  log.debug("poll: codex session " .. s.id .. " in project — no persisted thread, enriching")
-                  backend.session_show(s.id, function(ok3, detail)
-                    if ok3 and type(detail) == "table" then
-                      codex.enrich_session(detail, function(enriched)
-                        local tid = enriched and enriched.codex_thread_id
-                        if tid then
-                          log.info("poll: codex thread synced — " .. s.id .. " → " .. tid)
-                        else
-                          log.debug("poll: codex thread not yet available for " .. s.id)
-                        end
-                      end)
-                    end
-                  end)
+
+            if backend.name() == "cmux" then
+              -- cmux backend: read from cmux persist, enrich, write back
+              for _, s in ipairs(sessions) do
+                if (s.tool or "") == "codex"
+                  and s.status ~= "error" and s.status ~= "stopped"
+                  and grp.slugify(s.group or "") == project then
+                  local cmeta = persist.get_cmux_session(s.id)
+                  if cmeta and (not cmeta.codex_thread_id or cmeta.codex_thread_id == "") then
+                    log.debug("poll (cmux): codex session " .. s.id .. " — no thread, enriching")
+                    -- codex.enrich_session needs: tool, path, created_at, id
+                    cmeta.id = cmeta.id or cmeta.surface_id or s.id
+                    codex.enrich_session(cmeta, function(enriched)
+                      local tid = enriched and enriched.codex_thread_id
+                      if tid then
+                        -- Write back to cmux persist so session_restart can use it
+                        cmeta.codex_thread_id = tid
+                        persist.set_cmux_session(s.id, cmeta)
+                        log.info("poll (cmux): codex thread synced — " .. s.id .. " → " .. tid)
+                      else
+                        log.debug("poll (cmux): codex thread not yet available for " .. s.id)
+                      end
+                    end)
+                  end
+                end
+              end
+            else
+              -- agent-deck backend: uses _codex_threads persist + session_show
+              for _, s in ipairs(sessions) do
+                if (s.tool or "") == "codex"
+                  and s.status ~= "error" and s.status ~= "stopped"
+                  and grp.slugify(s.group or "") == project then
+                  local saved = persist.get_codex_thread(s.id)
+                  if not saved or saved == "" then
+                    log.debug("poll: codex session " .. s.id .. " in project — no persisted thread, enriching")
+                    backend.session_show(s.id, function(ok3, detail)
+                      if ok3 and type(detail) == "table" then
+                        codex.enrich_session(detail, function(enriched)
+                          local tid = enriched and enriched.codex_thread_id
+                          if tid then
+                            log.info("poll: codex thread synced — " .. s.id .. " → " .. tid)
+                          else
+                            log.debug("poll: codex thread not yet available for " .. s.id)
+                          end
+                        end)
+                      end
+                    end)
+                  end
                 end
               end
             end
@@ -255,6 +285,29 @@ function M.refresh()
     vim.notify("agent-deck: no sessions for current project", vim.log.levels.WARN)
     return
   end
+
+  -- ── cmux backend: simple restart via respawn-pane ─────────────────────────
+  -- No agent-deck-specific workarounds needed (codex stop→set→start,
+  -- claude_session_id restore). respawn-pane kills the process and starts
+  -- the new command atomically.
+  if backend.name() == "cmux" then
+    log.info("refresh (Dar/cmux): restarting " .. #ps .. " session(s) via respawn-pane")
+    local done = 0
+    for _, s in ipairs(ps) do
+      backend.session_restart(s.id, function(ok2)
+        done = done + 1
+        if ok2 then
+          vim.notify("agent-deck: restarted " .. (s.title or s.id))
+        else
+          vim.notify("agent-deck: failed to restart " .. (s.title or s.id), vim.log.levels.ERROR)
+        end
+        if done == #ps then do_poll() end
+      end)
+    end
+    return
+  end
+
+  -- ── agent-deck backend: full restart with workarounds ─────────────────────
   log.info("refresh (Dar): restarting " .. #ps .. " session(s) in external agent-deck")
 
   -- Step 1: fetch full details for all sessions to capture their claude_session_id
