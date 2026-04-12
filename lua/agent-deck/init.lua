@@ -75,6 +75,38 @@ local function do_poll()
             end
             -- Prune any errored sessions from the persist map
             persist.load_project(project)
+
+            -- Codex thread sync: unlike Claude (whose session UUID is tracked
+            -- natively by agent-deck via `session show --json → claude_session_id`),
+            -- Codex thread IDs live only in Codex's own SQLite DB. agent-deck
+            -- has no codex_thread_id field, so the plugin must resolve and
+            -- persist the mapping itself. For sessions with a live Neovim buffer
+            -- but no persisted thread, enrich from SQLite on each poll.
+            -- This catches threads created after Dan launch (codex creates
+            -- the thread only after the user sends the first message).
+            local codex = require("agent-deck.codex")
+            for _, s in ipairs(sessions) do
+              if (s.tool or "") == "codex"
+                and s.status ~= "error" and s.status ~= "stopped"
+                and grp.slugify(s.group or "") == project then
+                local saved = persist.get_codex_thread(s.id)
+                if not saved or saved == "" then
+                  log.debug("poll: codex session " .. s.id .. " in project — no persisted thread, enriching")
+                  backend.session_show(s.id, function(ok3, detail)
+                    if ok3 and type(detail) == "table" then
+                      codex.enrich_session(detail, function(enriched)
+                        local tid = enriched and enriched.codex_thread_id
+                        if tid then
+                          log.info("poll: codex thread synced — " .. s.id .. " → " .. tid)
+                        else
+                          log.debug("poll: codex thread not yet available for " .. s.id)
+                        end
+                      end)
+                    end
+                  end)
+                end
+              end
+            end
           end
         else
           log.warn("do_poll: list_sessions failed or returned non-table")
@@ -101,6 +133,11 @@ end
 
 function M.setup(opts)
   opts = opts or {}
+
+  -- Apply custom_claude_cmd override before backend init (cmux launch uses it too)
+  if opts.custom_claude_cmd then
+    require("agent-deck.session_cmd").set_custom_claude_cmd(opts.custom_claude_cmd)
+  end
 
   -- Initialize backend dispatch layer before anything else uses it
   local backend = require("agent-deck.backend")
@@ -236,31 +273,60 @@ function M.refresh()
         log.warn("refresh (Dar): session_show failed for " .. s.id .. " — restart may collide")
       end
       if fetched == count then
-        -- Step 2: restart each session, then restore its original claude_session_id
-        local done = 0
+        -- Step 2: look up codex thread IDs from persist
+        local persist = require("agent-deck.persist")
+        local codex_threads = {}
         for _, s2 in ipairs(ps) do
-          backend.session_restart(s2.id, function(ok2, _)
-            done = done + 1
-            if ok2 then
-              vim.notify("agent-deck: restarted " .. (s2.title or s2.id))
-              -- Restore the original claude_session_id so agent-deck keeps
-              -- distinct conversations even when sessions share a path.
-              -- Without this, agent-deck would assign the "last used in dir"
-              -- conversation to whichever session was restarted last.
-              local orig_id = details[s2.id] and details[s2.id].claude_session_id
-              if orig_id and orig_id ~= "" then
-                log.debug("refresh (Dar): restoring claude_session_id=" .. orig_id
-                  .. " for " .. s2.id)
-                backend.session_set(s2.id, "claude-session-id", orig_id, function() end)
-              end
-            else
-              log.error("refresh (Dar): session_restart failed for " .. (s2.title or s2.id))
-              vim.notify("agent-deck: failed to restart " .. (s2.title or s2.id), vim.log.levels.ERROR)
+          local tool = (details[s2.id] or {}).tool or s2.tool or ""
+          if tool == "codex" then
+            local saved = persist.get_codex_thread(s2.id)
+            if saved and saved ~= "" then
+              codex_threads[s2.id] = saved
+              log.debug("refresh (Dar): persisted codex_thread_id=" .. saved .. " for " .. s2.id)
             end
-            if done == count then
-              do_poll()  -- refresh state cache after all restarts complete
+          end
+        end
+
+        -- Step 3: restart each session
+        local done = 0
+        local function on_restart_done(s2, ok2)
+          done = done + 1
+          local tool = (details[s2.id] or {}).tool or s2.tool or ""
+          if ok2 then
+            vim.notify("agent-deck: restarted " .. (s2.title or s2.id))
+            local orig_id = details[s2.id] and details[s2.id].claude_session_id
+            if orig_id and orig_id ~= "" then
+              log.debug("refresh (Dar): restoring claude_session_id=" .. orig_id .. " for " .. s2.id)
+              backend.session_set(s2.id, "claude-session-id", orig_id, function() end)
             end
-          end)
+            if tool == "codex" and codex_threads[s2.id] then
+              backend.session_set(s2.id, "command", "codex", function() end)
+            end
+          else
+            log.error("refresh (Dar): session_restart failed for " .. (s2.title or s2.id))
+            vim.notify("agent-deck: failed to restart " .. (s2.title or s2.id), vim.log.levels.ERROR)
+          end
+          if done == count then do_poll() end
+        end
+
+        for _, s2 in ipairs(ps) do
+          local tool = (details[s2.id] or {}).tool or s2.tool or ""
+          local thread_id = codex_threads[s2.id]
+          if tool == "codex" and thread_id then
+            -- agent-deck "session restart" uses its own thread resolution which
+            -- picks the wrong thread. Workaround: stop → set command → start.
+            log.debug("refresh (Dar): stop→set→start for codex " .. s2.id
+              .. " thread=" .. thread_id)
+            backend.session_stop(s2.id, function()
+              backend.session_set(s2.id, "command", "codex resume " .. thread_id, function()
+                backend.session_start(s2.id, function(ok2)
+                  on_restart_done(s2, ok2)
+                end)
+              end)
+            end)
+          else
+            backend.session_restart(s2.id, function(ok2) on_restart_done(s2, ok2) end)
+          end
         end
       end
     end)

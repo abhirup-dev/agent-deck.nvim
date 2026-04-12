@@ -14,7 +14,8 @@ local M = {}
 --- @return string      Encoded path (e.g. "-Users-me-project")
 function M.encode_path(path)
   if not path then return "" end
-  return path:gsub("/", "-")
+  -- Claude replaces both "/" and "." with "-" in project directory encoding
+  return path:gsub("[/.]", "-")
 end
 
 --- Return the full .jsonl conversation file path for a given project path

@@ -420,10 +420,14 @@ function M.launch(path, opts, cb)
         local uuid = vim.fn.system("uuidgen"):gsub("%s+", "")
         log.debug("cmux launch: generated UUID " .. uuid .. " for claude_session_id")
 
-        -- Step 4: build command
+        -- Step 4: build command (uses agent-deck config for claude wrapper/env)
         local cmd
         if tool == "claude" then
-          cmd = "claude --session-id " .. uuid
+          local scmd = require("agent-deck.session_cmd")
+          cmd = scmd.build_cmd_new(
+            { tool = "claude", claude_session_id = uuid, id = "cmux-new", path = path },
+            function() return false end  -- new session, conv never exists yet
+          )
         elseif tool == "codex" then
           cmd = "codex"
         elseif tool == "opencode" then

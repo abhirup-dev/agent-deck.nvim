@@ -96,6 +96,11 @@ local function spawn_terminal(session)
   local state = require("agent-deck.state")
   local cwd   = session.path or vim.fn.getcwd()
   local cmd   = session_cmd.build_cmd_new(session, claude_paths.conv_exists)
+  if not cmd then
+    vim.notify("agent-deck: session is running in agent-deck but has no conversation yet.\n"
+      .. "Send a first message in the agent-deck terminal, then retry.", vim.log.levels.WARN)
+    return
+  end
 
   -- Helper: mark buf as hidden (survives window close), set keymaps, register TermClose
   local function cache(buf)
@@ -452,6 +457,24 @@ function M.new_session()
           require("agent-deck.backend").list_sessions(function(ok2, sessions)
             if ok2 then state.set_sessions(sessions) end
           end)
+          -- For claude: check after 2s if session is still waiting (needs
+          -- permission or approval in agent-deck terminal before Neovim can open it)
+          if tool == "claude" then
+            vim.defer_fn(function()
+              require("agent-deck.backend").session_show(data.id, function(ok3, detail)
+                if ok3 and type(detail) == "table" and detail.status == "waiting" then
+                  local claude_paths = require("agent-deck.claude_paths")
+                  local sid = detail.claude_session_id or ""
+                  local has_conv = sid ~= "" and claude_paths.conv_exists(cwd, sid)
+                  if not has_conv then
+                    vim.notify("agent-deck: '" .. title .. "' is waiting in agent-deck.\n"
+                      .. "Approve permissions or send first message there before opening in Neovim.",
+                      vim.log.levels.WARN)
+                  end
+                end
+              end)
+            end, 2000)
+          end
         else
           vim.notify("agent-deck: launch failed", vim.log.levels.ERROR)
         end

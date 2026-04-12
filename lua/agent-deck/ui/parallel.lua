@@ -92,12 +92,13 @@ local function register_process_exit(buf, session_id)
 end
 
 local session_cmd = require("agent-deck.session_cmd")
+local claude_paths = require("agent-deck.claude_paths")
 
 --- Build the command string used to spawn a terminal for a session.
---- Delegates to the shared session_cmd module (extracted from the duplicate
---- logic that previously lived here and in picker.lua).
+--- Uses build_cmd_new to handle new sessions (no .jsonl yet) correctly
+--- by falling back to --session-id instead of --resume.
 local function build_cmd(session)
-  return session_cmd.build_cmd(session)
+  return session_cmd.build_cmd_new(session, claude_paths.conv_exists)
 end
 
 --- Pre-fetch full session details for all sessions before opening any windows.
@@ -168,6 +169,13 @@ local function start_terminal(win, session)
   else
     -- Slow path: spawn a new native terminal process
     local cmd = build_cmd(session)
+    if not cmd then
+      vim.notify("agent-deck: '" .. (session.title or session.id)
+        .. "' is waiting in agent-deck (needs permission or first message). "
+        .. "Resolve in agent-deck terminal, then retry.", vim.log.levels.WARN)
+      vim.api.nvim_win_close(win, true)
+      return
+    end
     local cwd = session.path or vim.fn.getcwd()
     log.info("start_terminal: spawning terminal '" .. cmd .. "' in " .. cwd
       .. " for session " .. session.id)
