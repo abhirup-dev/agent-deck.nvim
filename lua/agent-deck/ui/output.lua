@@ -3,7 +3,7 @@ local M = {}
 
 function M.show()
   local state   = require("agent-deck.state")
-  local cli     = require("agent-deck.cli")
+  local backend = require("agent-deck.backend")
   local session = state.primary_session()
 
   if not session then
@@ -16,7 +16,7 @@ function M.show()
 
   local is_running = session.status == "running"
 
-  cli.session_output(session.id, function(ok, data)
+  backend.session_output(session.id, function(ok, data)
     if not ok then
       vim.notify("agent-deck: failed to get output", vim.log.levels.ERROR)
       return
