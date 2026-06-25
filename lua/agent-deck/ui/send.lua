@@ -30,7 +30,7 @@ local function ensure_sendable(session, cb)
     return
   end
   if session.status == "idle" or session.status == "stopped" then
-    require("agent-deck.cli").session_start(session.id, function(ok, _)
+    require("agent-deck.backend").session_start(session.id, function(ok, _)
       if ok then
         -- Small delay to let the agent process reach waiting state
         vim.defer_fn(function() cb(true) end, 600)
@@ -61,7 +61,7 @@ local function do_send(text)
       vim.notify("agent-deck: could not start session for send", vim.log.levels.ERROR)
       return
     end
-    require("agent-deck.cli").session_send(session.id, text, { no_wait = true }, function(ok, _)
+    require("agent-deck.backend").session_send(session.id, text, { no_wait = true }, function(ok, _)
       if ok then
         vim.notify("agent-deck: sent → " .. (session.title or session.id))
       else

@@ -36,6 +36,11 @@ function M.show()
   table.insert(lines, "  agent-deck.nvim — Info / Debug" )
   table.insert(lines, "  " .. string.rep("━", 50))
 
+  -- ── Backend ─────────────────────────────────────────────────────────────
+  local backend_name = require("agent-deck.backend").name()
+  section(lines, "Backend")
+  row(lines, "  active    ", backend_name)
+
   -- ── Project ─────────────────────────────────────────────────────────────
   section(lines, "Project")
   row(lines, "  current   ", state.current_project or "(none)")
@@ -142,8 +147,9 @@ function M.show()
 
   -- ── Binary ──────────────────────────────────────────────────────────────
   section(lines, "Binary")
-  local bin = vim.fn.exepath("agent-deck")
-  row(lines, "  ", bin ~= "" and bin or "(not found in PATH)")
+  local bin_name = backend_name == "cmux" and "cmux" or "agent-deck"
+  local bin = vim.fn.exepath(bin_name)
+  row(lines, "  " .. bin_name .. "  ", bin ~= "" and bin or "(not found in PATH)")
 
   -- ── Footer ──────────────────────────────────────────────────────────────
   table.insert(lines, "")

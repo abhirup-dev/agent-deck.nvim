@@ -56,28 +56,8 @@ local function time_ago(created_at)
   return string.format("%dh", math.floor(diff / 3600))
 end
 
---- Return true if a .jsonl conversation file exists for the given claude session ID
---- under the encoded project path in ~/.claude/projects/.
----
---- Background: agent-deck pre-generates a UUID as claude_session_id when a session
---- is created via `launch`. It immediately starts claude in a tmux pane with:
----   claude --session-id <pre-generated-uuid>
---- Claude creates the .jsonl file only once the TUI is fully initialised and the
---- first turn begins. Until then the file does not exist on disk.
----
---- This predicate is the single source of truth for distinguishing a brand-new
---- session (file absent) from an existing conversation (file present).  The
---- distinction determines which claude flag to pass — see spawn_terminal below.
----
---- Path encoding: claude stores conversations under
----   ~/.claude/projects/<encoded-path>/<session-id>.jsonl
---- where <encoded-path> is the absolute project path with every "/" replaced by "-".
-local function claude_conv_exists(path, session_id)
-  if not path or not session_id or session_id == "" then return false end
-  local encoded = path:gsub("/", "-")
-  local fpath   = vim.fn.expand("~/.claude/projects/") .. encoded .. "/" .. session_id .. ".jsonl"
-  return vim.fn.filereadable(fpath) == 1
-end
+local claude_paths = require("agent-deck.claude_paths")
+local session_cmd  = require("agent-deck.session_cmd")
 
 --- Spawn a new terminal for a session using the enriched session object.
 ---
@@ -114,31 +94,15 @@ end
 ---   Either path caches the buffer with bufhidden=hide for instant reattach.
 local function spawn_terminal(session)
   local state = require("agent-deck.state")
-  local tool  = session.tool or "claude"
   local cwd   = session.path or vim.fn.getcwd()
-  local cmd
-  local base_cmd = session.command or tool
-  if tool == "claude" and session.claude_session_id and session.claude_session_id ~= "" then
-    if claude_conv_exists(cwd, session.claude_session_id) then
-      -- Case 1: conversation file exists → resume the existing session
-      cmd = "claude --resume " .. session.claude_session_id
-      log.info("spawn_terminal: claude --resume " .. session.claude_session_id
-        .. " for session " .. session.id)
-    else
-      -- Case 2: file absent → new session; use --session-id to stay in sync with
-      -- the UUID agent-deck already assigned and started in its tmux pane.
-      cmd = "claude --session-id " .. session.claude_session_id
-      log.info("spawn_terminal: claude --session-id " .. session.claude_session_id
-        .. " (new, no conv file yet) for session " .. session.id)
-    end
-  elseif tool == "codex" and session.codex_thread_id and session.codex_thread_id ~= "" then
-    cmd = base_cmd .. " resume " .. session.codex_thread_id
-    log.info("spawn_terminal: codex resume " .. session.codex_thread_id
-      .. " for session " .. session.id)
-  else
-    -- Case 4: non-claude tool or no known resume identifier
-    cmd = base_cmd
-    log.info("spawn_terminal: '" .. cmd .. "' for session " .. session.id)
+  -- cmux-enriched sessions have _cmd_ready=true — command already built by
+  -- enrich_cmux_sessions. Agent-deck sessions go through build_cmd_new.
+  local cmd   = session._cmd_ready and session.command
+    or session_cmd.build_cmd_new(session, claude_paths.conv_exists)
+  if not cmd then
+    vim.notify("agent-deck: session is running in agent-deck but has no conversation yet.\n"
+      .. "Send a first message in the agent-deck terminal, then retry.", vim.log.levels.WARN)
+    return
   end
 
   -- Helper: mark buf as hidden (survives window close), set keymaps, register TermClose
@@ -226,9 +190,34 @@ local function open_session_terminal(session)
     return
   end
 
-  -- Slow path: fetch full details to get claude_session_id, then spawn
+  -- cmux backend: build command from persist metadata directly.
+  -- Uses session_cmd.build_cmd (shared util, always --resume for existing
+  -- sessions). Does NOT use the agent-deck path (session_show callback,
+  -- codex.enrich_session, build_cmd_new decision tree).
+  if require("agent-deck.backend").name() == "cmux" then
+    local persist = require("agent-deck.persist")
+    local scmd    = require("agent-deck.session_cmd")
+    local meta    = persist.get_cmux_session(session.id)
+    if not meta then
+      log.warn("open_session_terminal (cmux): no persist data for " .. session.id)
+      vim.notify("agent-deck: session metadata not found for " .. session.id, vim.log.levels.WARN)
+      return
+    end
+    -- Ensure id is set (persist stores surface_id, not id)
+    meta.id = meta.id or meta.surface_id or session.id
+    -- build_cmd uses --resume for claude sessions with claude_session_id,
+    -- bare command for other tools
+    local cmd = scmd.build_cmd(meta)
+    local cwd = meta.path or vim.fn.getcwd()
+    log.info("open_session_terminal (cmux): spawning terminal for " .. session.id
+      .. " cmd=" .. cmd .. " cwd=" .. cwd)
+    spawn_terminal(vim.tbl_extend("force", session, meta, { command = cmd, path = cwd, _cmd_ready = true }))
+    return
+  end
+
+  -- Slow path (agent-deck backend): fetch full details to get claude_session_id, then spawn
   log.debug("open_session_terminal: no live buf for " .. session.id .. " — fetching session_show")
-  require("agent-deck.cli").session_show(session.id, function(ok, data)
+  require("agent-deck.backend").session_show(session.id, function(ok, data)
     local enriched = (ok and type(data) == "table")
       and vim.tbl_extend("force", session, data)
       or session
@@ -293,11 +282,11 @@ function M.spawn_sessions(sessions)
 end
 
 function M.pick()
-  local cli     = require("agent-deck.cli")
+  local backend = require("agent-deck.backend")
   local state   = require("agent-deck.state")
   local persist = require("agent-deck.persist")
 
-  cli.list_sessions(function(ok, sessions)
+  backend.list_sessions(function(ok, sessions)
     if not ok then
       log.error("pick: list_sessions failed")
       vim.notify("agent-deck: failed to list sessions", vim.log.levels.ERROR)
@@ -399,7 +388,7 @@ function M.pick()
         ad_delete = function(picker, item)
           if not item or not item.session then return end
           local id = item.session.id
-          require("agent-deck.cli").session_delete(id, function(ok2, _)
+          require("agent-deck.backend").session_delete(id, function(ok2, _)
             vim.schedule(function()
               if ok2 then
                 vim.notify("agent-deck: deleted " .. id)
@@ -419,7 +408,7 @@ function M.pick()
 
         ad_stop = function(_, item)
           if not item or not item.session then return end
-          require("agent-deck.cli").session_stop(item.session.id, function(ok2, _)
+          require("agent-deck.backend").session_stop(item.session.id, function(ok2, _)
             if ok2 then
               vim.notify("agent-deck: stopped " .. (item.session.title or item.session.id))
             end
@@ -428,7 +417,7 @@ function M.pick()
 
         ad_restart = function(_, item)
           if not item or not item.session then return end
-          require("agent-deck.cli").session_restart(item.session.id, function(ok2, _)
+          require("agent-deck.backend").session_restart(item.session.id, function(ok2, _)
             if ok2 then
               vim.notify("agent-deck: restarted " .. (item.session.title or item.session.id))
             end
@@ -471,7 +460,7 @@ function M.new_session()
     if not tool then return end
     vim.ui.input({ prompt = "Session title: " }, function(title)
       if not title or title == "" then return end
-      require("agent-deck.cli").launch(cwd, {
+      require("agent-deck.backend").launch(cwd, {
         tool  = tool,
         title = title,
         group = project,
@@ -479,13 +468,70 @@ function M.new_session()
         if ok and type(data) == "table" and data.id then
           persist.add_session(project, data.id)
           vim.notify("agent-deck: launched '" .. title .. "' (" .. data.id .. ")")
-          require("agent-deck.cli").list_sessions(function(ok2, sessions)
+          require("agent-deck.backend").list_sessions(function(ok2, sessions)
             if ok2 then state.set_sessions(sessions) end
           end)
+          -- For claude: check after 2s if session is still waiting (needs
+          -- permission or approval in agent-deck terminal before Neovim can open it)
+          if tool == "claude" then
+            vim.defer_fn(function()
+              require("agent-deck.backend").session_show(data.id, function(ok3, detail)
+                if ok3 and type(detail) == "table" and detail.status == "waiting" then
+                  local claude_paths = require("agent-deck.claude_paths")
+                  local sid = detail.claude_session_id or ""
+                  local has_conv = sid ~= "" and claude_paths.conv_exists(cwd, sid)
+                  if not has_conv then
+                    vim.notify("agent-deck: '" .. title .. "' is waiting in agent-deck.\n"
+                      .. "Approve permissions or send first message there before opening in Neovim.",
+                      vim.log.levels.WARN)
+                  end
+                end
+              end)
+            end, 2000)
+          end
         else
           vim.notify("agent-deck: launch failed", vim.log.levels.ERROR)
         end
       end)
+    end)
+  end)
+end
+
+--- Focus a session in cmux's UI (cmux backend only).
+--- Opens a single-select picker; on confirm, calls backend.focus_session
+--- to bring the cmux surface/workspace to the front.
+function M.focus_pick()
+  local backend = require("agent-deck.backend")
+  if backend.name() ~= "cmux" then
+    vim.notify("agent-deck: focus_pick is only available with the cmux backend", vim.log.levels.WARN)
+    return
+  end
+
+  local state = require("agent-deck.state")
+  local sessions = state.get_sessions()
+  if not sessions or #sessions == 0 then
+    vim.notify("agent-deck: no sessions to focus", vim.log.levels.INFO)
+    return
+  end
+
+  -- Build picker items
+  local items = {}
+  for _, s in ipairs(sessions) do
+    local icon = ICONS[s.status] or "?"
+    local label = icon .. "  " .. (s.title or s.id) .. "  [" .. (s.group or "") .. "]"
+    table.insert(items, { text = label, session = s })
+  end
+
+  vim.ui.select(items, {
+    prompt = "Focus session in cmux:",
+    format_item = function(item) return item.text end,
+  }, function(choice)
+    if not choice then return end
+    log.info("focus_pick: focusing " .. choice.session.id .. " in cmux")
+    backend.focus_session(choice.session.id, function(ok, _)
+      if not ok then
+        vim.notify("agent-deck: failed to focus " .. choice.session.id, vim.log.levels.ERROR)
+      end
     end)
   end)
 end

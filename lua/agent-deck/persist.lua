@@ -236,4 +236,37 @@ function M.load_project(project)
   -- No M.save() — transient pruning, not a user-initiated mutation
 end
 
+-- ── cmux session metadata ────────────────────────────────────────────────────
+-- When backend="cmux", session metadata is managed by the plugin (not an
+-- external daemon). These accessors store per-surface data under the
+-- "_cmux_sessions" key in map.json.
+
+--- Return the cmux session metadata for a surface ID (or nil).
+function M.get_cmux_session(surface_id)
+  local m = _map["_cmux_sessions"]
+  return m and surface_id and m[surface_id] or nil
+end
+
+--- Store cmux session metadata for a surface ID.
+--- data = { surface_id, workspace_id, tool, title, path, group,
+---          command, claude_session_id, created_at }
+function M.set_cmux_session(surface_id, data)
+  _map["_cmux_sessions"] = _map["_cmux_sessions"] or {}
+  _map["_cmux_sessions"][surface_id] = data
+  M.save()
+end
+
+--- Remove cmux session metadata for a surface ID.
+function M.remove_cmux_session(surface_id)
+  if _map["_cmux_sessions"] then
+    _map["_cmux_sessions"][surface_id] = nil
+    M.save()
+  end
+end
+
+--- Return all cmux session metadata (table: surface_id → data).
+function M.all_cmux_sessions()
+  return _map["_cmux_sessions"] or {}
+end
+
 return M
