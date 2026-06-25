@@ -203,6 +203,57 @@ function M.setup(opts)
   reset_timer()
 
   -- ── Commands ───────────────────────────────────────────────────────────
+  vim.api.nvim_create_user_command("AgentDeckBackend", function(args)
+    local arg = args.args
+    local name
+    if arg == "cmux" then
+      name = "cmux"
+    elseif arg == "ad" or arg == "agent-deck" then
+      name = "agent-deck"
+    else
+      vim.notify("agent-deck: current backend = " .. backend.name()
+        .. "\nUsage: AgentDeckBackend <cmux|ad>", vim.log.levels.INFO)
+      return
+    end
+
+    if name == backend.name() then
+      vim.notify("agent-deck: already using " .. name, vim.log.levels.INFO)
+      return
+    end
+
+    log.info("AgentDeckBackend: switching " .. backend.name() .. " → " .. name)
+
+    -- 1. Close all parallel windows and kill terminal processes
+    local parallel = require("agent-deck.ui.parallel")
+    parallel.close_all()
+    for sid, buf in pairs(state._session_bufs or {}) do
+      if vim.api.nvim_buf_is_valid(buf) then
+        local job_id = vim.b[buf].terminal_job_id
+        if job_id then pcall(vim.fn.jobstop, job_id) end
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      end
+    end
+    state._session_bufs = {}
+
+    -- 2. Clear in-memory session list (IDs are backend-specific)
+    state.set_sessions({})
+
+    -- 3. Switch backend
+    backend.init(name)
+
+    -- 4. Restart poll timer to use the new backend
+    reset_timer()
+
+    -- 5. Immediately poll to populate sessions from the new backend
+    do_poll()
+
+    vim.notify("agent-deck: switched to " .. name .. " backend")
+  end, {
+    nargs = "?",
+    complete = function() return { "cmux", "ad" } end,
+    desc = "agent-deck: switch backend (cmux or ad)",
+  })
+
   vim.api.nvim_create_user_command("AgentDeckInfo", function()
     require("agent-deck.ui.info").show()
   end, { desc = "agent-deck: show debug info" })
